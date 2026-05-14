@@ -1,21 +1,22 @@
 .PHONY: install
 install: ## Install the poetry environment and install the pre-commit hooks
-	@echo "Creating virtual environment using pyenv and poetry"
-	@git submodule update --recursive
+	@echo [*] Updating git submodule recursively and remotely
+	@git submodule update --recursive --remote
+	@echo [*] Creating virtual environment and installing dependencies using poetry
 	@poetry lock
 	@poetry install --with dev
 	@poetry run pre-commit install
 
 .PHONY: check
 check: ## Run code quality tools
-	@echo "Checking Poetry lock file consistency with 'pyproject.toml': Running poetry check --lock"
+	@echo [*] Checking Poetry lock file consistency with 'pyproject.toml': Running poetry check --lock
 	@poetry check --lock
-	@echo "Linting code: Running pre-commit"
+	@echo [*] Linting code: Running pre-commit
 	@poetry run pre-commit run -a
 
 .PHONY: test
 test: ## Run unit tests
-	@echo "Run Unit Tests"
+	@echo [*] Running Unit Tests
 	@poetry run pytest tests/
 
 .PHONY: clean
