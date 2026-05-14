@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "ibtws"
+version = "0.1.0"
+description = ""
+authors = ["Home Workstation <kursus1010@gmail.com>"]
+packages = [{ include = "ibtws", from = "src" }]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+ib-async = {path = "libs/ib_async"}
+ibapi = {path = "libs/twsapi/pythonclient"}
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
