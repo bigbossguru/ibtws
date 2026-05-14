@@ -21,3 +21,13 @@ vulture = "^2.14"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["E501"]
+
+[tool.ruff.format]
+preview = true
