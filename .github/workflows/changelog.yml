@@ -1,0 +1,46 @@
+name: Update CHANGELOG
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  changelog:
+    name: Regenerate CHANGELOG.md
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate CHANGELOG.md with git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --verbose
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Open pull request with the updated changelog
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: chore/update-changelog
+          base: main
+          commit-message: "chore: update CHANGELOG.md"
+          title: "chore: update CHANGELOG.md"
+          body: |
+            Auto-generated changelog update triggered by ${{ github.event_name }}
+            (ref: `${{ github.ref }}`).
+          add-paths: CHANGELOG.md
+          delete-branch: true

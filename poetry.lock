@@ -489,18 +489,7 @@ filelock = {version = ">=3.24.2,<4", markers = "python_version >= \"3.10\""}
 platformdirs = ">=3.9.1,<5"
 python-discovery = ">=1.3.1"
 
-[[package]]
-name = "vulture"
-version = "2.16"
-description = "Find dead code"
-optional = false
-python-versions = ">=3.9"
-files = [
-    {file = "vulture-2.16-py3-none-any.whl", hash = "sha256:6e0f1c312cef1c87856957e5c2ca9608834a7c794c2180477f30bf0e4cc58eee"},
-    {file = "vulture-2.16.tar.gz", hash = "sha256:f8d9f6e2af03011664a3c6c240c9765b3f392917d3135fddca6d6a68d359f717"},
-]
-
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "c175cfb5ee4b4be9d942d3373eadc2169bd6c36b081b297d7fc39794e806428d"
+content-hash = "a8e60ba5cfb9365616eae68a5d1f5ac63660f75285fcf97979ed80d30c095645"

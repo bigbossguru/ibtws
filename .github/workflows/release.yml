@@ -1,0 +1,115 @@
+name: Release
+
+# Triggered when a PR is merged into main carrying one of the labels:
+#   release:patch  -> bump 0.1.0 -> 0.1.1
+#   release:minor  -> bump 0.1.0 -> 0.2.0
+#   release:major  -> bump 0.1.0 -> 1.0.0
+#
+# The job bumps the project version, regenerates CHANGELOG.md, commits both
+# back to main, creates the v<version> tag, builds the distribution, and
+# publishes a GitHub Release with the changelog notes.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Bump, changelog & release
+    if: >
+      github.event.pull_request.merged == true && (
+        contains(github.event.pull_request.labels.*.name, 'release:patch') ||
+        contains(github.event.pull_request.labels.*.name, 'release:minor') ||
+        contains(github.event.pull_request.labels.*.name, 'release:major')
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine bump kind from PR label
+        id: bump
+        run: |
+          labels='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          if echo "$labels" | grep -q '"release:major"'; then KIND=major
+          elif echo "$labels" | grep -q '"release:minor"'; then KIND=minor
+          else KIND=patch
+          fi
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout main (with submodules)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          submodules: recursive
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: "1.8.3"
+
+      - name: Bump project version
+        id: version
+        run: |
+          poetry version "${{ steps.bump.outputs.kind }}"
+          NEW=$(poetry version --short)
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: poetry install --with dev --no-interaction
+
+      - name: Run unit tests
+        run: poetry run pytest tests/ -q
+
+      - name: Build distribution
+        run: poetry build
+
+      - name: Regenerate CHANGELOG.md
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag ${{ steps.version.outputs.tag }} --verbose
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Generate release notes (latest section only)
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag ${{ steps.version.outputs.tag }} --unreleased --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Commit version + changelog and create tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml CHANGELOG.md
+          git commit -m "chore(release): ${{ steps.version.outputs.tag }}"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin main
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          files: dist/*
+          draft: false
+          prerelease: false

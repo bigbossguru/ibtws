@@ -1,27 +1,40 @@
-.PHONY: install
-install: ## Install the poetry environment and install the pre-commit hooks
-	@echo [*] Updating git submodule recursively and remotely
-	@git pull --recurse-submodules
+.PHONY: help install update check lint format test clean
+
+.DEFAULT_GOAL := help
+
+help:  ## Show this help message
+	@grep -E '^[a-zA-Z_-]+:.*?##' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-12s %s\n", $$1, $$2}'
+
+install:  ## Install the poetry environment and pre-commit hooks
+	@echo "📦 Initialising git submodules"
 	@git submodule update --init --recursive
-	@echo [*] Creating virtual environment and installing dependencies using poetry
-	@poetry lock
+	@echo "🐍 Creating virtual environment and installing dependencies using poetry"
 	@poetry install --with dev
 	@poetry run pre-commit install
 
-.PHONY: check
-check: ## Run code quality tools
-	@echo [*] Checking Poetry lock file consistency with 'pyproject.toml': Running poetry check --lock
+update:  ## Pull latest code and update submodules
+	@echo "⬇️  Pulling latest code and submodules"
+	@git pull --recurse-submodules
+	@git submodule update --init --recursive
+
+check:  ## Run all code quality tools (lock check + pre-commit)
+	@echo "🔒 Checking poetry lock file consistency with pyproject.toml"
 	@poetry check --lock
-	@echo [*] Linting code: Running pre-commit
+	@echo "🧹 Linting code: running pre-commit on all files"
 	@poetry run pre-commit run -a
 
-.PHONY: test
-test: ## Run unit tests
-	@echo [*] Running Unit Tests
-	@poetry run pytest tests/
+lint:  ## Run ruff linter
+	@poetry run ruff check src tests
 
-.PHONY: clean
-clean: ## Remove generated files
-	@rm -fr .mypy_cache .ruff_cache .pytest_cache .vscode
-	@find . -type d -name "__pycache__" -exec rm -r {} +
-	@find src -regex '^.*\(__pycache__\|\.py[co]\)$$' -delete
+format:  ## Auto-format code with ruff
+	@poetry run ruff format src tests
+	@poetry run ruff check --fix src tests
+
+test:  ## Run unit tests (pass extra args via ARGS=...)
+	@echo "🧪 Running unit tests"
+	@poetry run pytest tests/ $(ARGS)
+
+clean:  ## Remove generated caches and build artifacts
+	@rm -rf .mypy_cache .ruff_cache .pytest_cache .vscode .coverage htmlcov dist build
+	@find . -type d -name "__pycache__" -prune -exec rm -rf {} +
+	@find . -type d -name "*.egg-info" -prune -exec rm -rf {} +
