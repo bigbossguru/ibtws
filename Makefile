@@ -1,7 +1,8 @@
 .PHONY: install
 install: ## Install the poetry environment and install the pre-commit hooks
 	@echo [*] Updating git submodule recursively and remotely
-	@git submodule update --recursive --remote
+	@git pull --recurse-submodules
+	@git submodule update --init --recursive
 	@echo [*] Creating virtual environment and installing dependencies using poetry
 	@poetry lock
 	@poetry install --with dev
