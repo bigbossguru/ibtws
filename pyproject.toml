@@ -10,6 +10,7 @@ readme = "README.md"
 python = "^3.12"
 ib-async = {path = "libs/ib_async"}
 ibapi = {path = "libs/twsapi/pythonclient"}
+pandas = "^3.0.3"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^4.6.0"
