@@ -17,6 +17,7 @@ import asyncio
 import logging
 from datetime import datetime
 
+import pandas as pd
 from ib_async import Index
 
 from ibtws.config import IBKRConfig
@@ -40,43 +41,31 @@ def on_error(req_id: int, code: int, msg: str, advanced: str) -> None:
 
 
 async def main() -> None:
-    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)  # TWS paper
-    client = IBKRClient(
-        config,
-        # on_connected=on_connected,
-        # on_disconnected=on_disconnected,
-        # on_error=on_error,
-    )
-    await client.connect()
-    try:
+    config = IBKRConfig(port=7497, client_id=14)  # TWS paper
+
+    async with IBKRClient(config) as client:
+        await client.connect()
+
         # 1 = live, 2 = frozen, 3 = delayed, 4 = delayed-frozen
-        client.ib.reqMarketDataType(4)
+        client.ib.reqMarketDataType(2)
 
         underlying = Index("SPX", "CBOE", "USD")
-        (underlying,) = await client.qualify(underlying)
+        [underlying] = await client.qualify(underlying)
 
         fetcher = OptionChainFetcher(client)
 
-        chain = await fetcher.fetch_chain_definition(underlying, trading_class="SPXW")
-        print(
-            f"SPX chain: {len(chain.expirations)} expiries, {len(chain.strikes)} strikes, "
-            f"trading_class={chain.trading_class}, exchange={chain.exchange}"
-        )
-
         # SPX has hundreds of listed strikes — auto-window to ±5% of spot to
         # keep the request bounded.
-        df = await fetcher.fetch_snapshot_df(
+        df = await fetcher.fetch_snapshot(
             underlying,
-            expirations=[chain.expirations[1]],
-            rights=("C", "P"),
+            expirations=["20260518"],
             trading_class="SPXW",
-            strike_window_pct=0.05,
+            strike_window_pct=0.02,
+            as_dataframe=True,
         )
-
-        print(df.head(20))
-        df.to_csv(f"spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False)
-    finally:
-        await client.disconnect()
+        if isinstance(df, pd.DataFrame):
+            print(df.head(20))
+            df.to_csv(f"spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False)
 
 
 if __name__ == "__main__":
