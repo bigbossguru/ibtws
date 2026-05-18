@@ -1,4 +1,4 @@
-"""03 — Full tour of ``ibtws.unofficial.order``.
+"""02 — Full tour of ``ibtws.unofficial.order``.
 
 Each section below is independently togglable. Uncomment the ones you want to
 exercise, leave the rest commented. The default config just calls
