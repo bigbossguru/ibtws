@@ -29,19 +29,26 @@ footer = ""
 
 [git]
 conventional_commits = true
-filter_unconventional = true
+filter_unconventional = false
 split_commits = false
 commit_parsers = [
-  { message = "^feat",      group = "Features" },
-  { message = "^fix",       group = "Bug Fixes" },
-  { message = "^perf",      group = "Performance" },
-  { message = "^refactor",  group = "Refactoring" },
-  { message = "^docs",      group = "Documentation" },
-  { message = "^test",      group = "Tests" },
-  { message = "^build",     group = "Build" },
-  { message = "^ci",        group = "CI" },
-  { message = "^chore",     skip = true },
-  { message = "^style",     skip = true },
+  { message = "^feat",                       group = "Features" },
+  { message = "^fix",                        group = "Bug Fixes" },
+  { message = "^perf",                       group = "Performance" },
+  { message = "^refactor",                   group = "Refactoring" },
+  { message = "^docs",                       group = "Documentation" },
+  { message = "^test",                       group = "Tests" },
+  { message = "^build",                      group = "Build" },
+  { message = "^ci",                         group = "CI" },
+  { message = "^chore\\(release\\):",       skip = true },
+  { message = "^chore",                      group = "Chores" },
+  { message = "^style",                      skip = true },
+  # Fallbacks for non-conventional commit styles used in this repo
+  { message = "^(?i)fix[: ]",                group = "Bug Fixes" },
+  { message = "^(?i)refactor[: ]",           group = "Refactoring" },
+  { message = "^(?i)impl[: ]",               group = "Features" },
+  { message = "^(?i)feat[: ]",               group = "Features" },
+  { message = ".*",                          group = "Other" },
 ]
 filter_commits = false
 tag_pattern = "v[0-9]*"

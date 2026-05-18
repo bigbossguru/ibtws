@@ -21,7 +21,11 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          fetch-tags: true
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure tags are present
+        run: git fetch --tags --force
 
       - name: Generate CHANGELOG.md with git-cliff
         uses: orhun/git-cliff-action@v4
