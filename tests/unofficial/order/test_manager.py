@@ -163,6 +163,14 @@ async def test_place_bracket_submits_three(manager, fake_client):
     assert submitted_orders[0].transmit is False
     assert submitted_orders[1].transmit is False
     assert submitted_orders[2].transmit is True
+    # IB bracket wiring: children point to parent's orderId, TP/SL share OCA group
+    parent_id = submitted_orders[0].orderId
+    assert parent_id  # non-zero, allocated via getReqId
+    assert submitted_orders[1].parentId == parent_id
+    assert submitted_orders[2].parentId == parent_id
+    assert submitted_orders[1].ocaGroup == submitted_orders[2].ocaGroup
+    assert submitted_orders[1].ocaGroup  # non-empty
+    assert submitted_orders[1].ocaType == 1 and submitted_orders[2].ocaType == 1
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +206,18 @@ async def test_cancel_emits_cancelled_on_status_event(manager, fake_client):
 async def test_cancel_unknown_uuid_raises(manager):
     with pytest.raises(KeyError):
         await manager.cancel("no-such-uuid")
+
+
+async def test_cancel_all_skips_terminal(manager, fake_client):
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=1)
+    t1 = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+    fake_client.ib.placeOrder.return_value = make_trade("p2", perm_id=2)
+    t2 = await manager.place(build_limit(make_contract(), OrderSide.SELL, 1, 105.0))
+    t2.state = OrderState.FILLED
+
+    cancelled = await manager.cancel_all()
+    assert cancelled == [t1.uuid]
+    assert fake_client.ib.cancelOrder.call_count == 1
 
 
 async def test_cancel_idempotent_after_terminal(manager, fake_client):
@@ -267,6 +287,102 @@ async def test_open_orders_excludes_terminal(manager, fake_client):
     opens = manager.open_orders
     assert t1 in opens
     assert t2 not in opens
+
+
+# ---------------------------------------------------------------------------
+# Position close helpers
+# ---------------------------------------------------------------------------
+
+
+async def test_close_position_flattens_long(manager, fake_client):
+    contract = make_contract(con_id=42)
+    pos = make_position(account="DU1", contract=contract, quantity=3, avg_cost=100)
+    fake_client.ib.positionEvent.fire(pos)
+    await asyncio.sleep(0)
+
+    fake_client.ib.qualifyContractsAsync.return_value = [contract]
+    fake_client.ib.placeOrder.return_value = make_trade("close", perm_id=99)
+
+    closed = await manager.close_position(42)
+
+    assert closed is not None
+    submitted = fake_client.ib.placeOrder.call_args.args[1]
+    assert submitted.action == "SELL"
+    assert submitted.totalQuantity == 3
+
+
+async def test_close_position_flattens_short(manager, fake_client):
+    contract = make_contract(con_id=7)
+    pos = make_position(contract=contract, quantity=-2, avg_cost=100)
+    fake_client.ib.positionEvent.fire(pos)
+    await asyncio.sleep(0)
+
+    fake_client.ib.qualifyContractsAsync.return_value = [contract]
+    fake_client.ib.placeOrder.return_value = make_trade("close", perm_id=1)
+
+    await manager.close_position(7)
+    submitted = fake_client.ib.placeOrder.call_args.args[1]
+    assert submitted.action == "BUY"
+    assert submitted.totalQuantity == 2
+
+
+async def test_close_position_unknown_conid_returns_none(manager):
+    assert await manager.close_position(9999) is None
+
+
+async def test_close_position_zero_quantity_returns_none(manager, fake_client):
+    pos = make_position(contract=make_contract(con_id=5), quantity=0, avg_cost=0)
+    fake_client.ib.positionEvent.fire(pos)
+    await asyncio.sleep(0)
+    assert await manager.close_position(5) is None
+
+
+async def test_close_position_cancels_working_orders_first(manager, fake_client):
+    contract = make_contract(con_id=11)
+    # Place a working limit on the same contract.
+    fake_client.ib.placeOrder.return_value = make_trade("working", perm_id=1)
+    working = await manager.limit(contract, OrderSide.BUY, 1, 100.0)
+
+    pos = make_position(contract=contract, quantity=1, avg_cost=100)
+    fake_client.ib.positionEvent.fire(pos)
+    await asyncio.sleep(0)
+
+    fake_client.ib.qualifyContractsAsync.return_value = [contract]
+    fake_client.ib.placeOrder.return_value = make_trade("close", perm_id=2)
+
+    await manager.close_position(11)
+
+    assert fake_client.ib.cancelOrder.called
+    cancelled_order = fake_client.ib.cancelOrder.call_args.args[0]
+    assert cancelled_order is working.trade.order
+
+
+async def test_close_position_limit_requires_price(manager, fake_client):
+    contract = make_contract(con_id=22)
+    fake_client.ib.positionEvent.fire(make_position(contract=contract, quantity=1, avg_cost=100))
+    await asyncio.sleep(0)
+    fake_client.ib.qualifyContractsAsync.return_value = [contract]
+
+    with pytest.raises(ValueError, match="limit_price"):
+        await manager.close_position(22, kind="limit")
+
+
+async def test_close_all_positions(manager, fake_client):
+    c1 = make_contract(con_id=1)
+    c2 = make_contract(con_id=2)
+    fake_client.ib.positionEvent.fire(make_position(contract=c1, quantity=1))
+    fake_client.ib.positionEvent.fire(make_position(contract=c2, quantity=-1))
+    fake_client.ib.positionEvent.fire(make_position(contract=make_contract(con_id=3), quantity=0))
+    await asyncio.sleep(0)
+
+    fake_client.ib.qualifyContractsAsync.side_effect = lambda c: [c]
+    fake_client.ib.placeOrder.side_effect = [
+        make_trade("c1", perm_id=11),
+        make_trade("c2", perm_id=22),
+    ]
+
+    closed = await manager.close_all_positions()
+    assert len(closed) == 2  # zero-quantity skipped
 
 
 # ---------------------------------------------------------------------------

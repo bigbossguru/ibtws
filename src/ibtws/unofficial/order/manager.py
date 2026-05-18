@@ -21,11 +21,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+
+from ib_async import Contract
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Optional
 
-from .factory import bracket_to_orders, request_to_order
+from .factory import (
+    bracket_to_orders,
+    build_bracket,
+    build_limit,
+    build_market,
+    build_stop,
+    request_to_order,
+)
 from .models import (
     BracketRequest,
     Cancelled,
@@ -38,6 +47,7 @@ from .models import (
     Rejected,
     RequestSubmitted,
     StatusChanged,
+    TimeInForce,
     TrackedOrder,
     serialise_contract,
 )
@@ -81,6 +91,10 @@ class OrderManager:
         self._tracked: dict[str, TrackedOrder] = {}
         self._uuid_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._positions: dict[tuple, PositionChanged] = {}
+        # Live ib_async.Contract refs keyed by conId, captured from position
+        # events. Used by close_position to avoid re-qualifying from a flat
+        # dict (which can fail for synthetic contracts like ContFuture).
+        self._position_contracts: dict[int, Any] = {}
 
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._min_interval = 1.0 / pace_per_sec if pace_per_sec > 0 else 0.0
@@ -145,6 +159,15 @@ class OrderManager:
                 timestamp=snap.timestamp,
             )
 
+        # Cache live Contract refs for close_position. reconcile() returns
+        # serialised snapshots only — we need the raw ib_async.Contract
+        # objects to flatten positions without re-qualifying from a dict
+        # (which fails for synthetic contracts like ContFuture).
+        for p in await self._client.ib.reqPositionsAsync():
+            conid = getattr(p.contract, "conId", 0)
+            if conid:
+                self._position_contracts[conid] = p.contract
+
         self._started = True
         logger.info(f"OrderManager: started (account={primary}, tracked={len(self._tracked)})")
         return report
@@ -203,7 +226,14 @@ class OrderManager:
         tp_uuid = f"{group}_tp"
         sl_uuid = f"{group}_sl"
 
-        orders = bracket_to_orders(request, parent_uuid, tp_uuid, sl_uuid)
+        orders = bracket_to_orders(
+            request,
+            parent_uuid,
+            tp_uuid,
+            sl_uuid,
+            parent_order_id=self._client.ib.client.getReqId(),
+            oca_group=group,
+        )
 
         # Persist the group submission first.
         await self._store.append(_build_submitted_event(parent_uuid, request, bracket_group=group))
@@ -226,6 +256,216 @@ class OrderManager:
 
         self._monitor.publish(_build_submitted_event(parent_uuid, request, bracket_group=group))
         return tracked_list
+
+    # ------------------------------------------------------------------
+    # Convenience builders: one-call build + place
+    # ------------------------------------------------------------------
+
+    async def market(
+        self,
+        contract: Any,
+        side: OrderSide,
+        quantity: float,
+        *,
+        tif: TimeInForce = TimeInForce.DAY,
+        account: Optional[str] = None,
+    ) -> TrackedOrder:
+        """Build a market request and submit it in one call."""
+        return await self.place(build_market(contract, side, quantity, tif=tif, account=account))
+
+    async def limit(
+        self,
+        contract: Any,
+        side: OrderSide,
+        quantity: float,
+        limit_price: float,
+        *,
+        tif: TimeInForce = TimeInForce.DAY,
+        account: Optional[str] = None,
+    ) -> TrackedOrder:
+        """Build a limit request and submit it in one call."""
+        return await self.place(build_limit(contract, side, quantity, limit_price, tif=tif, account=account))
+
+    async def stop_order(
+        self,
+        contract: Any,
+        side: OrderSide,
+        quantity: float,
+        stop_price: float,
+        *,
+        tif: TimeInForce = TimeInForce.DAY,
+        account: Optional[str] = None,
+    ) -> TrackedOrder:
+        """Build a stop request and submit it in one call.
+
+        Named ``stop_order`` rather than ``stop`` to avoid shadowing the
+        :meth:`stop` lifecycle method that tears the manager down.
+        """
+        return await self.place(build_stop(contract, side, quantity, stop_price, tif=tif, account=account))
+
+    async def bracket(
+        self,
+        contract: Any,
+        side: OrderSide,
+        quantity: float,
+        *,
+        take_profit_price: float,
+        stop_loss_price: float,
+        entry_limit_price: Optional[float] = None,
+        tif: TimeInForce = TimeInForce.DAY,
+        account: Optional[str] = None,
+    ) -> list[TrackedOrder]:
+        """Build a bracket request and submit it in one call."""
+        return await self.place_bracket(
+            build_bracket(
+                contract,
+                side,
+                quantity,
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
+                entry_limit_price=entry_limit_price,
+                tif=tif,
+                account=account,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Position management
+    # ------------------------------------------------------------------
+
+    async def close_position(
+        self,
+        con_id: int,
+        *,
+        kind: str = "market",
+        limit_price: Optional[float] = None,
+        cancel_working: bool = True,
+    ) -> Optional[TrackedOrder]:
+        """Flatten a single position by ``conId``.
+
+        Cancels any working orders on the same contract first (unless
+        ``cancel_working=False``), re-qualifies the contract via IB by
+        ``conId``, then submits an opposite-side market or limit order for
+        ``abs(quantity)``.
+
+        Returns the new :class:`TrackedOrder`, or ``None`` if no non-zero
+        position exists for that ``conId``.
+        """
+        self._require_started()
+        pos = next(
+            (p for p in self._positions.values() if p.contract.get("conId") == con_id),
+            None,
+        )
+        if pos is None:
+            known = [(p.contract.get("symbol"), p.contract.get("conId"), p.quantity) for p in self._positions.values()]
+            logger.warning(
+                f"close_position: no position for conId={con_id}. Known positions (symbol, conId, qty): {known}"
+            )
+            return None
+        if pos.quantity == 0:
+            logger.warning(f"close_position: conId={con_id} has zero quantity, nothing to close.")
+            return None
+
+        if cancel_working:
+            for t in list(self._tracked.values()):
+                if t.state in (OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED):
+                    continue
+                req_contract = getattr(t.request, "contract", None) if t.request else None
+                if req_contract is not None and getattr(req_contract, "conId", 0) == con_id:
+                    await self.cancel(t.uuid)
+
+        skeleton = self._position_contracts.get(con_id)
+        if skeleton is None:
+            skeleton = Contract(
+                conId=con_id,
+                symbol=pos.contract.get("symbol") or "",
+                secType=pos.contract.get("secType") or "",
+                exchange=pos.contract.get("exchange") or "",
+                currency=pos.contract.get("currency") or "",
+                lastTradeDateOrContractMonth=pos.contract.get("lastTradeDateOrContractMonth") or "",
+                strike=pos.contract.get("strike") or 0.0,
+                right=pos.contract.get("right") or "",
+                multiplier=pos.contract.get("multiplier") or "",
+                tradingClass=pos.contract.get("tradingClass") or "",
+            )
+        # Positions from reqPositionsAsync come back with exchange="" — IB
+        # refuses orders without a routing destination. qualifyContractsAsync
+        # backfills exchange/primaryExchange from conId.
+        contract = skeleton
+        if not getattr(contract, "exchange", ""):
+            qualified = await self._client.ib.qualifyContractsAsync(contract)
+            if not qualified:
+                raise RuntimeError(f"Failed to qualify contract conId={con_id}")
+            contract = qualified[0]
+        self._position_contracts[con_id] = contract
+
+        side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+        qty = abs(pos.quantity)
+        account = pos.account or None
+        if kind == "market":
+            return await self.market(contract, side, qty, account=account)
+        if kind == "limit":
+            if limit_price is None:
+                raise ValueError("limit_price is required when kind='limit'")
+            return await self.limit(contract, side, qty, limit_price, account=account)
+        raise ValueError(f"Unsupported close kind: {kind!r} (use 'market' or 'limit')")
+
+    async def refresh_positions(self) -> list[PositionChanged]:
+        """Pull fresh positions from IB, update the local cache, return them.
+
+        Useful right before flattening — ``positionEvent`` from IB can lag
+        several seconds after a fill, so the cached ``self.positions`` may be
+        stale or empty.
+        """
+        self._require_started()
+        fresh = await self._client.ib.reqPositionsAsync()
+        snapshots: list[PositionChanged] = []
+        for p in fresh:
+            conid = getattr(p.contract, "conId", 0)
+            if not conid:
+                continue
+            snap = PositionChanged(
+                account=p.account,
+                contract=serialise_contract(p.contract),
+                quantity=float(p.position),
+                avg_cost=float(p.avgCost),
+            )
+            self._positions[(p.account, conid)] = snap
+            self._position_contracts[conid] = p.contract
+            snapshots.append(snap)
+        return snapshots
+
+    async def close_all_positions(self, *, kind: str = "market", cancel_working: bool = True) -> list[TrackedOrder]:
+        """Flatten every non-zero position. Returns the list of closing orders.
+
+        Always pulls fresh positions from IB before acting — don't rely on
+        ``positionEvent`` having reached us yet.
+        """
+        await self.refresh_positions()
+        closed: list[TrackedOrder] = []
+        non_zero = [p for p in self._positions.values() if p.quantity != 0]
+        if not non_zero:
+            logger.info("close_all_positions: no non-zero positions found.")
+            return closed
+        for pos in non_zero:
+            con_id = pos.contract.get("conId")
+            if not con_id:
+                continue
+            tracked = await self.close_position(con_id, kind=kind, cancel_working=cancel_working)
+            if tracked is not None:
+                closed.append(tracked)
+        return closed
+
+    async def cancel_all(self) -> list[str]:
+        """Cancel every non-terminal tracked order. Returns the cancelled uuids."""
+        self._require_started()
+        cancelled: list[str] = []
+        for t in list(self._tracked.values()):
+            if t.state in (OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED):
+                continue
+            await self.cancel(t.uuid)
+            cancelled.append(t.uuid)
+        return cancelled
 
     async def cancel(self, uuid: str) -> None:
         """Request cancellation. Idempotent — already-terminal orders are a no-op."""
@@ -323,6 +563,8 @@ class OrderManager:
             avg_cost=float(position.avgCost),
         )
         self._positions[key] = event
+        if contract["conId"]:
+            self._position_contracts[contract["conId"]] = position.contract
         self._dispatch(event)
 
     # ------------------------------------------------------------------

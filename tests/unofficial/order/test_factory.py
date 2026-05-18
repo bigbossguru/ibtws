@@ -60,7 +60,7 @@ def test_build_bracket_happy():
     c = make_contract()
     req = build_bracket(c, OrderSide.BUY, 1, take_profit_price=110, stop_loss_price=90)
     assert isinstance(req, BracketRequest)
-    assert req.tif == TimeInForce.GTC
+    assert req.tif == TimeInForce.DAY
 
 
 def test_build_quantity_must_be_positive():
@@ -114,9 +114,10 @@ def test_bracket_to_orders_market_entry():
         take_profit_price=110,
         stop_loss_price=90,
     )
-    parent, tp, sl = bracket_to_orders(req, "p", "tp", "sl")
+    parent, tp, sl = bracket_to_orders(req, "p", "tp", "sl", parent_order_id=42, oca_group="grp-1")
     assert isinstance(parent, MarketOrder)
     assert parent.action == "BUY"
+    assert parent.orderId == 42
     assert isinstance(tp, LimitOrder) and tp.action == "SELL" and tp.lmtPrice == 110
     assert isinstance(sl, StopOrder) and sl.action == "SELL" and sl.auxPrice == 90
     assert parent.transmit is False
@@ -125,6 +126,10 @@ def test_bracket_to_orders_market_entry():
     assert parent.orderRef == "p"
     assert tp.orderRef == "tp"
     assert sl.orderRef == "sl"
+    # IB bracket wiring
+    assert tp.parentId == 42 and sl.parentId == 42
+    assert tp.ocaGroup == "grp-1" and sl.ocaGroup == "grp-1"
+    assert tp.ocaType == 1 and sl.ocaType == 1
 
 
 def test_bracket_to_orders_limit_entry_sell():
@@ -136,9 +141,11 @@ def test_bracket_to_orders_limit_entry_sell():
         stop_loss_price=110,
         entry_limit_price=100,
     )
-    parent, tp, sl = bracket_to_orders(req, "p", "tp", "sl")
+    parent, tp, sl = bracket_to_orders(req, "p", "tp", "sl", parent_order_id=7, oca_group="g")
     assert isinstance(parent, LimitOrder)
     assert parent.action == "SELL"
     assert parent.lmtPrice == 100
     assert tp.action == "BUY"
     assert sl.action == "BUY"
+    assert tp.parentId == 7 and sl.parentId == 7
+    assert tp.ocaGroup == "g" and sl.ocaGroup == "g"

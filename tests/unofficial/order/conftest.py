@@ -104,6 +104,8 @@ def fake_client():
 
     ib = MagicMock()
     ib.managedAccounts = MagicMock(return_value=["DU123"])
+    ib.client = MagicMock()
+    ib.client.getReqId = MagicMock(side_effect=lambda: 10000)
     ib.orderStatusEvent = _EventHook()
     ib.execDetailsEvent = _EventHook()
     ib.positionEvent = _EventHook()
@@ -112,6 +114,7 @@ def fake_client():
     ib.openTrades = MagicMock(return_value=[])
     ib.placeOrder = MagicMock()
     ib.cancelOrder = MagicMock()
+    ib.qualifyContractsAsync = AsyncMock()
     return SimpleNamespace(ib=ib)
 
 
