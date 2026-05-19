@@ -25,3 +25,5 @@ poetry run python examples/01_basic_snapshot.py
 | File | What it shows |
 |---|---|
 | `01_basic_snapshot.py` | Minimum viable usage: connect, fetch a small snapshot, print it. |
+| `02_basic_order.py` | Full tour of `ibtws.unofficial.order` (placement, events, cancel, close, replay). |
+| `03_iv_rank.py` | Compute IV Rank / IV Percentile from IB's historical 30-day ATM IV series. |
