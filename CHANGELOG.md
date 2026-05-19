@@ -60,5 +60,3 @@ Co-authored-by: Eldar Gazizov <150266617+egazizov-r7@users.noreply.github.com>
 ### Refactoring
 
 - Unofficial ib client and unit tests, workflow gh
-
-

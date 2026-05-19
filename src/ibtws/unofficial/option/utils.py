@@ -67,7 +67,7 @@ def _pick_price(ticker: Ticker, attr: str) -> Optional[float]:
     return _safe_price(getattr(ticker, attr, None))
 
 
-def _ticker_to_quote(ticker: Ticker) -> OptionQuote:
+def _ticker_to_quote(ticker: Ticker, underlying_price: Optional[float] = None) -> OptionQuote:
     """Map an ib_async ``Ticker`` snapshot into an :class:`OptionQuote`."""
     greeks = getattr(ticker, "modelGreeks", None)
     return OptionQuote(
@@ -85,7 +85,7 @@ def _ticker_to_quote(ticker: Ticker) -> OptionQuote:
         gamma=_safe_float(getattr(greeks, "gamma", None)) if greeks else None,
         vega=_safe_float(getattr(greeks, "vega", None)) if greeks else None,
         theta=_safe_float(getattr(greeks, "theta", None)) if greeks else None,
-        underlying_price=_safe_float(getattr(greeks, "undPrice", None)) if greeks else None,
+        underlying_price=underlying_price,
     )
 
 

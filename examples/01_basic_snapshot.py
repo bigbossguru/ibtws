@@ -56,15 +56,16 @@ async def main() -> None:
 
         # SPX has hundreds of listed strikes — auto-window to ±5% of spot to
         # keep the request bounded.
+        logging.info(f"Fetching SPX chain snapshot (frozen data) for {underlying}...")
         df = await fetcher.fetch_snapshot(
             underlying,
-            expirations=["20260518"],
+            expirations=["20260519"],
             trading_class="SPXW",
             strike_window_pct=0.02,
             as_dataframe=True,
         )
         if isinstance(df, pd.DataFrame):
-            print(df.head(20))
+            logging.info(df.head(20))
             df.to_csv(f"spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False)
 
 
