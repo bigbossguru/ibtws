@@ -138,7 +138,7 @@ class OptionChainFetcher:
         rather than an exception. Set ``as_dataframe=True`` to return a
         ``pandas.DataFrame`` via :func:`quotes_to_dataframe`.
         """
-        contracts = await self._build_and_qualify(
+        contracts, spot_price = await self._build_and_qualify(
             underlying,
             exchange=exchange,
             currency=currency,
@@ -156,7 +156,7 @@ class OptionChainFetcher:
         quotes: list[OptionQuote] = []
         for batch in _chunked(contracts, batch_size):
             tickers = await self._snapshot_batch(batch)
-            quotes.extend(_ticker_to_quote(t) for t in tickers)
+            quotes.extend(_ticker_to_quote(t, spot_price) for t in tickers)
 
         return quotes_to_dataframe(quotes) if as_dataframe else quotes
 
@@ -179,7 +179,7 @@ class OptionChainFetcher:
         strike_from: Optional[float],
         strike_to: Optional[float],
         strike_window_pct: Optional[float] = None,
-    ) -> list[Option]:
+    ) -> tuple[list[Option], Optional[float]]:
         if not underlying.conId:
             (underlying,) = await self._client.qualify(underlying)
 
@@ -187,6 +187,7 @@ class OptionChainFetcher:
 
         selected_exp = _filter_expirations(definition.expirations, expirations, expiry_from, expiry_to)
 
+        spot: Optional[float] = None
         no_explicit_strikes = strikes is None and strike_from is None and strike_to is None
         if selected_exp and no_explicit_strikes and strike_window_pct is not None and strike_window_pct > 0:
             spot = await self._fetch_spot(underlying)
@@ -205,7 +206,7 @@ class OptionChainFetcher:
             logger.warning(
                 f"OptionChainFetcher: empty filter window — {len(selected_exp)} expiries, {len(selected_str)} strikes"
             )
-            return []
+            return [], spot
 
         contracts = [
             Option(
@@ -226,33 +227,16 @@ class OptionChainFetcher:
         logger.info(
             f"OptionChainFetcher: qualifying {len(contracts)} candidate contracts for {definition.underlying_symbol}"
         )
-        return await self._qualify_in_batches(contracts)
-
-    async def _qualify_in_batches(self, contracts: list[Option], batch_size: int = 50) -> list[Option]:
-        resolved: list[Option] = []
-        dropped = 0
-        for batch in _chunked(contracts, batch_size):
-            async with self._slot():
-                try:
-                    await self._client.qualify(*batch)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"OptionChainFetcher: qualify batch failed ({exc}) — dropping batch")
-                    dropped += len(batch)
-                    continue
-            for c in batch:
-                if c.conId:
-                    resolved.append(c)
-                else:
-                    dropped += 1
-                    logger.debug(
-                        f"OptionChainFetcher: dropping unqualified {c.symbol} "
-                        f"{c.lastTradeDateOrContractMonth} {c.strike}{c.right} (no conId)"
-                    )
-        logger.info(
-            f"OptionChainFetcher: qualified {len(resolved)}/{len(contracts)} contracts "
-            f"({dropped} dropped — strike/expiry not listed)"
-        )
-        return resolved
+        try:
+            qualified = await self._client.qualify(*contracts)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"OptionChainFetcher: qualify failed for {definition.underlying_symbol}: {exc}")
+            return [], spot
+        resolved = [c for c in qualified if getattr(c, "conId", 0)]
+        dropped = len(qualified) - len(resolved)
+        if dropped:
+            logger.warning(f"OptionChainFetcher: dropped {dropped} unresolved contract(s) after qualify")
+        return resolved, spot
 
     async def _fetch_spot(self, underlying: Contract) -> Optional[float]:
         """Best-effort one-shot fetch of the underlying's spot price."""
@@ -282,6 +266,10 @@ class OptionChainFetcher:
     async def _snapshot_batch(self, contracts: list[Option]) -> list[Ticker]:
         async with self._slot():
             try:
+                [
+                    self._client.ib.reqMktData(c, genericTickList="100,101,106") for c in contracts
+                ]  # pre-warm market data subscriptions to reduce snapshot latency
+                await asyncio.sleep(0.2)  # give IB a moment to process the market data requests
                 tickers = await asyncio.wait_for(
                     self._client.ib.reqTickersAsync(*contracts, regulatorySnapshot=False),
                     timeout=self._snapshot_timeout,
