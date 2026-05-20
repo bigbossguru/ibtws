@@ -41,7 +41,7 @@ def on_error(req_id: int, code: int, msg: str, advanced: str) -> None:
 
 
 async def main() -> None:
-    config = IBKRConfig(port=7497, client_id=14)  # TWS paper
+    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)  # TWS paper
 
     async with IBKRClient(config) as client:
         await client.connect()
@@ -59,14 +59,14 @@ async def main() -> None:
         logging.info(f"Fetching SPX chain snapshot (frozen data) for {underlying}...")
         df = await fetcher.fetch_snapshot(
             underlying,
-            expirations=["20260519"],
+            expirations=["20260520"],
             trading_class="SPXW",
             strike_window_pct=0.02,
             as_dataframe=True,
         )
         if isinstance(df, pd.DataFrame):
             logging.info(df.head(20))
-            df.to_csv(f"spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False)
+            df.to_csv(f"output/spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False)
 
 
 if __name__ == "__main__":

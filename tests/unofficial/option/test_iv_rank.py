@@ -149,8 +149,9 @@ async def test_calculate_flat_history_returns_none_rank(calc, hist_mock):
 
 
 async def test_calculate_single_bar_percentile_uses_self(calc, hist_mock):
-    # With only one observation there is no "prior" history; the implementation
-    # falls back to comparing against itself, which can never be strictly less.
+    # With only one observation there is no prior history, so iv_percentile
+    # is undefined: it must be None (not a false 0.0 that downstream callers
+    # could mistake for "IV at the bottom of its range").
     hist_mock.return_value = [_bar(0.2, _dt.date(2026, 5, 19))]
 
     result = await calc.calculate(make_underlying())
@@ -158,7 +159,7 @@ async def test_calculate_single_bar_percentile_uses_self(calc, hist_mock):
     assert result.sample_size == 1
     assert result.current_iv == pytest.approx(0.2)
     assert result.iv_rank is None
-    assert result.iv_percentile == pytest.approx(0.0)
+    assert result.iv_percentile is None
 
 
 async def test_calculate_accepts_datetime_bar_date(calc, hist_mock):

@@ -76,6 +76,7 @@ class MarketRequest:
     quantity: float
     tif: TimeInForce = TimeInForce.DAY
     account: Optional[str] = None
+    outside_rth: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ class LimitRequest:
     limit_price: float
     tif: TimeInForce = TimeInForce.DAY
     account: Optional[str] = None
+    outside_rth: bool = False
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,7 @@ class StopRequest:
     stop_price: float
     tif: TimeInForce = TimeInForce.DAY
     account: Optional[str] = None
+    outside_rth: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,7 @@ class BracketRequest:
     entry_limit_price: Optional[float] = None  # None → market entry
     tif: TimeInForce = TimeInForce.GTC
     account: Optional[str] = None
+    outside_rth: bool = False
 
 
 OrderRequest = Union[MarketRequest, LimitRequest, StopRequest]
@@ -142,6 +146,31 @@ class PositionSnapshot:
     contract: dict  # serialised
     quantity: float
     avg_cost: float
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
+class PositionPnL:
+    """On-demand mark-to-market snapshot for a single open position.
+
+    Pure value object: produced by :meth:`OrderManager.current_pnl`, never
+    persisted to the audit log (PnL is derived, not authoritative).
+
+    ``market_price``, ``market_value`` and ``unrealized_pnl`` are ``None`` when
+    no usable quote was returned (after-hours on an instrument without an
+    extended-hours feed, market-data subscription missing, snapshot timeout,
+    etc.). Callers must treat ``None`` as \"unknown\", not as ``0.0``.
+    """
+
+    account: str
+    contract: dict  # serialised
+    quantity: float
+    avg_cost: float
+    multiplier: float  # contract multiplier (1.0 for stocks, 100 for US options, ...)
+    cost_basis: float  # quantity * avg_cost (already includes multiplier — IB's avgCost is per-share*mult)
+    market_price: Optional[float]
+    market_value: Optional[float]  # quantity * market_price * multiplier
+    unrealized_pnl: Optional[float]  # market_value - cost_basis
     timestamp: float = field(default_factory=time.time)
 
 
@@ -227,7 +256,29 @@ class PositionChanged:
         return {"kind": "position_changed", **self.__dict__}
 
 
-OrderEvent = Union[RequestSubmitted, StatusChanged, Filled, Cancelled, Rejected, PositionChanged]
+@dataclass(frozen=True)
+class LegMismatch:
+    """A BAG/bracket fill produced a position state that doesn't match the request.
+
+    Emitted by :class:`OrderManager` after a combo or bracket entry fills if
+    the resulting per-leg positions don't reconcile with the original
+    intent — typically caused by a partial fill on one combo leg or a
+    rejected child order in a bracket. Strategies should treat this as
+    "stranded position, take corrective action".
+    """
+
+    uuid: str
+    bracket_group: Optional[str]
+    expected: dict  # {conId: expected_qty}
+    actual: dict  # {conId: actual_qty}
+    detail: str
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return {"kind": "leg_mismatch", **self.__dict__}
+
+
+OrderEvent = Union[RequestSubmitted, StatusChanged, Filled, Cancelled, Rejected, PositionChanged, LegMismatch]
 
 
 _EVENT_TYPES = {
@@ -237,6 +288,7 @@ _EVENT_TYPES = {
     "cancelled": Cancelled,
     "rejected": Rejected,
     "position_changed": PositionChanged,
+    "leg_mismatch": LegMismatch,
 }
 
 

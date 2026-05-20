@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 from ib_async import Contract, Option, Ticker
 
+from ibtws.unofficial._pacing import ThrottledExecutor
 from ibtws.unofficial.client import IBKRClient
 
 from .models import ChainDefinition, OptionQuote
@@ -20,6 +20,7 @@ from .utils import (
     _filter_strikes,
     _pick_price,
     _ticker_to_quote,
+    is_quote_fresh,
     quotes_to_dataframe,
 )
 
@@ -31,10 +32,15 @@ class OptionChainFetcher:
     """Reliable, throttled option-chain quote fetcher built on :class:`IBKRClient`.
 
     The fetcher does not manage the IB connection — the caller owns
-    ``connect()`` / ``disconnect()``. Pacing is enforced via a semaphore
-    (``max_concurrency``) plus a token-bucket delay (``pace_per_sec``) to stay
-    under IB's ~50 msg/s ceiling. Per-batch ``snapshot_timeout`` guarantees
-    forward progress when IB silently drops a snapshot.
+    ``connect()`` / ``disconnect()``. Pacing is enforced via a
+    :class:`ThrottledExecutor` (semaphore + token bucket) to stay under IB's
+    ~50 msg/s ceiling. Per-batch ``snapshot_timeout`` guarantees forward
+    progress when IB silently drops a snapshot.
+
+    Subscriptions opened by :meth:`fetch_snapshot` are tracked so callers
+    can call :meth:`release` after they're done with the data (e.g. after a
+    position closes) to free the underlying market-data line and avoid
+    hitting IB's per-session subscription cap.
     """
 
     def __init__(
@@ -44,13 +50,17 @@ class OptionChainFetcher:
         max_concurrency: int = 25,
         pace_per_sec: float = 40.0,
         snapshot_timeout: float = 20.0,
+        quote_max_age_s: float = 0.0,
+        executor: Optional[ThrottledExecutor] = None,
     ) -> None:
         self._client = client
-        self._semaphore = asyncio.Semaphore(max_concurrency)
-        self._min_interval = 1.0 / pace_per_sec if pace_per_sec > 0 else 0.0
-        self._next_slot = 0.0
-        self._pace_lock = asyncio.Lock()
+        self._executor = executor or ThrottledExecutor(max_concurrency=max_concurrency, pace_per_sec=pace_per_sec)
         self._snapshot_timeout = snapshot_timeout
+        self._quote_max_age_s = quote_max_age_s
+        # conId -> ib_async Contract for every contract we've subscribed to via
+        # reqMktData. Lets release() call cancelMktData with the *exact* object
+        # IB handed us (the only thing it cross-references for the cancel).
+        self._subscribed: dict[int, Contract] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -154,9 +164,20 @@ class OptionChainFetcher:
         )
 
         quotes: list[OptionQuote] = []
+        now = time.time()
+        dropped_stale = 0
         for batch in _chunked(contracts, batch_size):
             tickers = await self._snapshot_batch(batch)
-            quotes.extend(_ticker_to_quote(t, spot_price) for t in tickers)
+            for t in tickers:
+                if self._quote_max_age_s > 0 and not is_quote_fresh(t, self._quote_max_age_s, now=now):
+                    dropped_stale += 1
+                    continue
+                quotes.append(_ticker_to_quote(t, spot_price))
+        if dropped_stale:
+            logger.debug(
+                f"OptionChainFetcher: dropped {dropped_stale} stale ticker(s) "
+                f"(quote_max_age_s={self._quote_max_age_s:.1f}s)"
+            )
 
         return quotes_to_dataframe(quotes) if as_dataframe else quotes
 
@@ -264,11 +285,13 @@ class OptionChainFetcher:
         return None
 
     async def _snapshot_batch(self, contracts: list[Option]) -> list[Ticker]:
-        async with self._slot():
+        async with self._executor.slot():
             try:
-                [
-                    self._client.ib.reqMktData(c, genericTickList="100,101,106") for c in contracts
-                ]  # pre-warm market data subscriptions to reduce snapshot latency
+                for c in contracts:
+                    self._client.ib.reqMktData(c, genericTickList="100,101,106")
+                    cid = int(getattr(c, "conId", 0) or 0)
+                    if cid:
+                        self._subscribed[cid] = c
                 await asyncio.sleep(0.2)  # give IB a moment to process the market data requests
                 tickers = await asyncio.wait_for(
                     self._client.ib.reqTickersAsync(*contracts, regulatorySnapshot=False),
@@ -285,21 +308,45 @@ class OptionChainFetcher:
                 return []
         return list(tickers)
 
-    @asynccontextmanager
-    async def _slot(self) -> AsyncIterator[None]:
-        """Acquire concurrency + pacing slot; release semaphore on exit."""
-        async with self._semaphore:
-            await self._await_next_slot()
-            yield
+    def release(self, contracts: Iterable[Contract]) -> int:
+        """Cancel market-data subscriptions opened by previous snapshots.
+
+        Each session has a hard cap on simultaneous market-data lines
+        (typically 100). Strategies that build/close many spreads per day
+        accumulate subscriptions if they never release them — eventually
+        IB will start refusing new ``reqMktData`` calls. Call this when a
+        position is closed and the quotes are no longer needed.
+
+        Unknown / unsubscribed contracts are silently ignored. Returns the
+        number of subscriptions actually cancelled.
+        """
+        released = 0
+        for c in contracts:
+            cid = int(getattr(c, "conId", 0) or 0)
+            sub = self._subscribed.pop(cid, None) if cid else None
+            if sub is None:
+                continue
+            try:
+                self._client.ib.cancelMktData(sub)
+                released += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"OptionChainFetcher.release: cancelMktData failed for conId={cid}: {exc}")
+        return released
+
+    @property
+    def subscribed_count(self) -> int:
+        """Number of contracts currently held open via ``reqMktData``."""
+        return len(self._subscribed)
+
+    # Backwards-compat shims for the previous inline pacing API. Tests and
+    # downstream callers still reach for ``_min_interval`` / ``_await_next_slot``;
+    # delegate to the executor so behaviour is identical.
+    @property
+    def _min_interval(self) -> float:
+        return self._executor.min_interval
 
     async def _await_next_slot(self) -> None:
-        """Sleep until the next pacing slot opens; no-op when pacing disabled."""
-        if self._min_interval <= 0:
-            return
-        async with self._pace_lock:
-            now = time.monotonic()
-            wait = self._next_slot - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-                now = time.monotonic()
-            self._next_slot = now + self._min_interval
+        await self._executor._await_next_slot()
+
+    def _slot(self):
+        return self._executor.slot()

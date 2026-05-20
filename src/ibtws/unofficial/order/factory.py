@@ -41,8 +41,16 @@ def build_market(
     *,
     tif: TimeInForce = TimeInForce.DAY,
     account: Optional[str] = None,
+    outside_rth: bool = False,
 ) -> MarketRequest:
-    req = MarketRequest(contract=contract, side=side, quantity=quantity, tif=tif, account=account)
+    req = MarketRequest(
+        contract=contract,
+        side=side,
+        quantity=quantity,
+        tif=tif,
+        account=account,
+        outside_rth=outside_rth,
+    )
     validate_request(req)
     return req
 
@@ -55,9 +63,16 @@ def build_limit(
     *,
     tif: TimeInForce = TimeInForce.DAY,
     account: Optional[str] = None,
+    outside_rth: bool = False,
 ) -> LimitRequest:
     req = LimitRequest(
-        contract=contract, side=side, quantity=quantity, limit_price=limit_price, tif=tif, account=account
+        contract=contract,
+        side=side,
+        quantity=quantity,
+        limit_price=limit_price,
+        tif=tif,
+        account=account,
+        outside_rth=outside_rth,
     )
     validate_request(req)
     return req
@@ -71,8 +86,17 @@ def build_stop(
     *,
     tif: TimeInForce = TimeInForce.DAY,
     account: Optional[str] = None,
+    outside_rth: bool = False,
 ) -> StopRequest:
-    req = StopRequest(contract=contract, side=side, quantity=quantity, stop_price=stop_price, tif=tif, account=account)
+    req = StopRequest(
+        contract=contract,
+        side=side,
+        quantity=quantity,
+        stop_price=stop_price,
+        tif=tif,
+        account=account,
+        outside_rth=outside_rth,
+    )
     validate_request(req)
     return req
 
@@ -87,6 +111,7 @@ def build_bracket(
     entry_limit_price: Optional[float] = None,
     tif: TimeInForce = TimeInForce.DAY,
     account: Optional[str] = None,
+    outside_rth: bool = False,
 ) -> BracketRequest:
     req = BracketRequest(
         contract=contract,
@@ -97,6 +122,7 @@ def build_bracket(
         entry_limit_price=entry_limit_price,
         tif=tif,
         account=account,
+        outside_rth=outside_rth,
     )
     validate_request(req)
     return req
@@ -120,6 +146,7 @@ def request_to_order(request: OrderRequest, order_ref: str) -> Order:
         raise TypeError(f"request_to_order does not handle {type(request).__name__}")
     order.tif = request.tif.value
     order.orderRef = order_ref
+    order.outsideRth = bool(request.outside_rth)
     if request.account:
         order.account = request.account
     return order
@@ -157,11 +184,13 @@ def bracket_to_orders(
     parent.orderId = parent_order_id
     parent.orderRef = parent_ref
     parent.tif = request.tif.value
+    parent.outsideRth = bool(request.outside_rth)
     parent.transmit = False  # hold until children are queued
 
     take_profit = LimitOrder(exit_side.value, request.quantity, request.take_profit_price)
     take_profit.orderRef = tp_ref
     take_profit.tif = request.tif.value
+    take_profit.outsideRth = bool(request.outside_rth)
     take_profit.parentId = parent_order_id
     take_profit.ocaGroup = oca_group
     take_profit.ocaType = 1  # cancel-with-block
@@ -170,6 +199,7 @@ def bracket_to_orders(
     stop_loss = StopOrder(exit_side.value, request.quantity, request.stop_loss_price)
     stop_loss.orderRef = sl_ref
     stop_loss.tif = request.tif.value
+    stop_loss.outsideRth = bool(request.outside_rth)
     stop_loss.parentId = parent_order_id
     stop_loss.ocaGroup = oca_group
     stop_loss.ocaType = 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Iterable, Optional, Sequence
 
 import pandas as pd
@@ -65,6 +66,52 @@ def _safe_price(value) -> Optional[float]:
 def _pick_price(ticker: Ticker, attr: str) -> Optional[float]:
     """Return the price at ``attr``, scrubbing IB's ``-1`` / NaN sentinels."""
     return _safe_price(getattr(ticker, attr, None))
+
+
+def _ticker_age_s(ticker: Ticker, *, now: Optional[float] = None) -> Optional[float]:
+    """Best-effort age of a Ticker snapshot in seconds.
+
+    IB tickers carry a ``time`` attribute (datetime in UTC). When present we
+    return ``now - ticker.time`` in seconds. When absent (some snapshot paths
+    omit it) we fall back to the most recent of ``bidTime`` / ``askTime`` /
+    ``lastTime`` if any are populated. Returns ``None`` when no timestamp
+    is available — callers should treat that as "age unknown", not "fresh".
+    """
+    ref = now if now is not None else time.time()
+
+    def _ts(value) -> Optional[float]:
+        if value is None:
+            return None
+        # ib_async ticker timestamps are datetime; older paths give floats.
+        try:
+            return float(value.timestamp()) if hasattr(value, "timestamp") else float(value)
+        except (TypeError, ValueError):
+            return None
+
+    candidates = []
+    for attr in ("time", "lastTime", "bidTime", "askTime"):
+        ts = _ts(getattr(ticker, attr, None))
+        if ts is not None:
+            candidates.append(ts)
+    if not candidates:
+        return None
+    age = ref - max(candidates)
+    return age if age >= 0 else 0.0
+
+
+def is_quote_fresh(ticker: Ticker, max_age_s: float, *, now: Optional[float] = None) -> bool:
+    """Return True when the ticker's timestamp is within ``max_age_s`` of *now*.
+
+    A missing timestamp is treated as *not fresh* — better to drop and retry
+    than to act on a quote whose age we cannot verify. ``max_age_s <= 0``
+    disables the check (always fresh).
+    """
+    if max_age_s <= 0:
+        return True
+    age = _ticker_age_s(ticker, now=now)
+    if age is None:
+        return False
+    return age <= max_age_s
 
 
 def _ticker_to_quote(ticker: Ticker, underlying_price: Optional[float] = None) -> OptionQuote:

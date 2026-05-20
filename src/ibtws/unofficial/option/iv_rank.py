@@ -146,7 +146,10 @@ class IVRankCalculator:
         spread = hi - lo
         iv_rank = ((current - lo) / spread * 100.0) if spread > 0 else None
         # Percentile: share of *historical* observations strictly below current.
-        history = ivs[:-1] if len(ivs) > 1 else ivs
+        # Always exclude the current bar; if that leaves no history (single-bar
+        # series) the percentile is undefined — do NOT silently return 0.0,
+        # which downstream strategies could misread as "IV at bottom of range".
+        history = ivs[:-1]
         below = sum(1 for v in history if v < current)
         iv_percentile = (below / len(history) * 100.0) if history else None
 

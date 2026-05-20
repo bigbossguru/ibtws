@@ -51,6 +51,36 @@ async def test_paper_guard_allows_live_when_overridden(fake_client, tmp_store):
     await mgr.stop()
 
 
+async def test_paper_guard_refuses_empty_managed_accounts(fake_client, tmp_store):
+    fake_client.ib.managedAccounts.return_value = []
+    mgr = OrderManager(fake_client, tmp_store, pace_per_sec=0)
+    with pytest.raises(RuntimeError, match="managedAccounts"):
+        await mgr.start()
+
+
+async def test_place_refuses_unknown_per_request_account(manager, fake_client):
+    contract = make_contract()
+    req = build_limit(contract, OrderSide.BUY, 1, 100.0, account="U999999")
+    with pytest.raises(RuntimeError, match="not in the session"):
+        await manager.place(req)
+    fake_client.ib.placeOrder.assert_not_called()
+
+
+async def test_place_refuses_live_per_request_account_without_override(fake_client, tmp_store):
+    # Paper-primary session that nevertheless has visibility into a live
+    # sub-account (e.g. FA setup). The per-request account guard must refuse.
+    fake_client.ib.managedAccounts.return_value = ["DU123", "U999999"]
+    mgr = OrderManager(fake_client, tmp_store, pace_per_sec=0)
+    await mgr.start()
+    try:
+        req = build_limit(make_contract(), OrderSide.BUY, 1, 100.0, account="U999999")
+        with pytest.raises(RuntimeError, match="live account"):
+            await mgr.place(req)
+        fake_client.ib.placeOrder.assert_not_called()
+    finally:
+        await mgr.stop()
+
+
 async def test_double_start_raises(fake_client, tmp_store):
     mgr = OrderManager(fake_client, tmp_store, pace_per_sec=0)
     await mgr.start()
@@ -135,6 +165,26 @@ async def test_status_event_without_orderref_ignored(manager, fake_client):
     fake_client.ib.orderStatusEvent.fire(make_trade("", perm_id=1))
     await asyncio.sleep(0)
     assert [e for e in seen if isinstance(e, StatusChanged)] == []
+
+
+async def test_exec_details_dedup_by_exec_id(manager, fake_client):
+    """IB replays execDetails on reconnect — we must only publish each fill once."""
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=7)
+    req = build_limit(make_contract(), OrderSide.BUY, 1, 100.0)
+    tracked = await manager.place(req)
+
+    seen: list = []
+    manager.on_event(lambda e: seen.append(e))
+
+    trade = make_trade(tracked.uuid, perm_id=7)
+    fill = make_fill("E1", price=100.5, shares=1)
+    fake_client.ib.execDetailsEvent.fire(trade, fill)
+    fake_client.ib.execDetailsEvent.fire(trade, fill)  # replay
+    await asyncio.sleep(0)
+
+    fills = [e for e in seen if isinstance(e, Filled)]
+    assert len(fills) == 1
+    assert fills[0].exec_id == "E1"
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +346,7 @@ async def test_open_orders_excludes_terminal(manager, fake_client):
 
 async def test_close_position_flattens_long(manager, fake_client):
     contract = make_contract(con_id=42)
-    pos = make_position(account="DU1", contract=contract, quantity=3, avg_cost=100)
+    pos = make_position(account="DU123", contract=contract, quantity=3, avg_cost=100)
     fake_client.ib.positionEvent.fire(pos)
     await asyncio.sleep(0)
 
@@ -448,3 +498,87 @@ async def test_orderstatus_event_routes_after_rehydration(fake_client, tmp_store
     assert len(status_events) >= 1
     assert status_events[0].state == OrderState.FILLED.value
     await mgr.stop()
+
+
+# ---------------------------------------------------------------------------
+# current_pnl
+# ---------------------------------------------------------------------------
+
+
+async def test_current_pnl_computes_pnl(manager, fake_client):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    contract = make_contract(con_id=42)
+    pos = make_position(account="DU123", contract=contract, quantity=10, avg_cost=150.0)
+    fake_client.ib.positionEvent.fire(pos)
+    await asyncio.sleep(0)
+
+    ticker = SimpleNamespace(contract=SimpleNamespace(conId=42), bid=160.0, ask=160.40, last=160.10, close=159.0)
+    fake_client.ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+
+    pnls = await manager.current_pnl()
+
+    assert len(pnls) == 1
+    p = pnls[0]
+    assert p.quantity == 10.0
+    assert p.avg_cost == 150.0
+    assert p.multiplier == 1.0
+    # mid = 160.20 → market_value = 1602; cost basis = 1500; unrealized = 102.
+    assert p.market_price == pytest.approx(160.20)
+    assert p.market_value == pytest.approx(1602.0)
+    assert p.cost_basis == pytest.approx(1500.0)
+    assert p.unrealized_pnl == pytest.approx(102.0)
+
+
+async def test_current_pnl_skips_flat_positions(manager, fake_client):
+    from unittest.mock import AsyncMock
+
+    pos = make_position(contract=make_contract(con_id=11), quantity=0, avg_cost=0.0)
+    fake_client.ib.positionEvent.fire(pos)
+    await asyncio.sleep(0)
+    fake_client.ib.reqTickersAsync = AsyncMock(return_value=[])
+
+    pnls = await manager.current_pnl()
+    assert pnls == []
+    fake_client.ib.reqTickersAsync.assert_not_called()
+
+
+async def test_current_pnl_marks_unknown_when_no_quote(manager, fake_client):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    contract = make_contract(con_id=77)
+    fake_client.ib.positionEvent.fire(make_position(account="DU123", contract=contract, quantity=5, avg_cost=100.0))
+    await asyncio.sleep(0)
+
+    # Ticker with no bid/ask/last/close — all None → price unavailable.
+    blank = SimpleNamespace(contract=SimpleNamespace(conId=77), bid=None, ask=None, last=None, close=None)
+    fake_client.ib.reqTickersAsync = AsyncMock(return_value=[blank])
+
+    pnls = await manager.current_pnl()
+    assert len(pnls) == 1
+    assert pnls[0].market_price is None
+    assert pnls[0].market_value is None
+    assert pnls[0].unrealized_pnl is None
+    assert pnls[0].cost_basis == pytest.approx(500.0)
+
+
+async def test_current_pnl_filters_by_conid(manager, fake_client):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    fake_client.ib.positionEvent.fire(
+        make_position(account="DU123", contract=make_contract(con_id=1), quantity=1, avg_cost=10)
+    )
+    fake_client.ib.positionEvent.fire(
+        make_position(account="DU123", contract=make_contract(con_id=2), quantity=1, avg_cost=20)
+    )
+    await asyncio.sleep(0)
+
+    ticker = SimpleNamespace(contract=SimpleNamespace(conId=2), bid=25, ask=25.20, last=25, close=24)
+    fake_client.ib.reqTickersAsync = AsyncMock(return_value=[ticker])
+
+    pnls = await manager.current_pnl(con_ids=[2])
+    assert len(pnls) == 1
+    assert pnls[0].contract["conId"] == 2
