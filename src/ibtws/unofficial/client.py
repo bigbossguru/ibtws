@@ -37,6 +37,7 @@ from typing import Callable, Optional
 from ib_async import IB, Contract
 
 from ibtws.config import IBKRConfig
+from ibtws.unofficial._ib_errors import ErrorCategory, classify
 
 logger = logging.getLogger(__name__)
 
@@ -391,8 +392,8 @@ class IBKRClient:
         self._connected_at = time.monotonic()
         logger.info(
             "IBKRClient: connected – account=%s  server_version=%s",
-            self.ib.client.serverVersion(),
             self.ib.wrapper.accounts,
+            self.ib.client.serverVersion(),
         )
         # Cancel any in-flight reconnect loop.
         if self._reconnect_task and not self._reconnect_task.done():
@@ -437,18 +438,13 @@ class IBKRClient:
                 self._reconnect_task = asyncio.ensure_future(self._reconnect_loop())
 
     def _handle_error(self, req_id: int, error_code: int, error_str: str, advanced_order_reject: str) -> None:
-        """
-        ``errorEvent`` callback — classifies IBKR error codes by severity.
+        """``errorEvent`` callback — classifies IBKR error codes by severity.
 
-        IBKR mixes informational notices, market-data farm status pings, and
-        genuine errors into a single channel. This handler maps them to
-        appropriate Python log levels so noisy infra messages do not drown out
-        real failures:
-
-        * **1100–1300** — connection / system messages → ``WARNING``.
-        * **2100–2200** — API warnings → ``WARNING``.
-        * **2104, 2106, 2107, 2108, 2119, 2158** — benign farm-status pings → ``DEBUG``.
-        * everything else → ``ERROR``.
+        Codes are routed through :func:`ibtws.unofficial._ib_errors.classify`
+        so callers can react to category (CONNECTION / MARKET_DATA / ORDER /
+        PACING / INFO) without re-implementing the lookup. Log level is
+        chosen from the category, so noisy infra messages don't drown out
+        real failures.
 
         Parameters
         ----------
@@ -463,25 +459,20 @@ class IBKRClient:
             JSON string with extra detail when the error is an order
             rejection; empty otherwise.
         """
-        # System / connection messages – treat as warnings, not errors.
-        if 1100 <= error_code <= 1300:
-            logger.warning("IBKRClient [sys %d]: reqId=%d  %s", error_code, req_id, error_str)
-        elif 2100 <= error_code <= 2200:
-            logger.warning("IBKRClient [warn %d]: reqId=%d  %s", error_code, req_id, error_str)
-        elif error_code in {
-            # Benign informational codes – log at DEBUG.
-            2104,
-            2106,
-            2107,
-            2108,
-            2119,
-            2158,
-        }:
+        category = classify(error_code)
+        if category is ErrorCategory.INFO:
             logger.debug("IBKRClient [info %d]: reqId=%d  %s", error_code, req_id, error_str)
+        elif category is ErrorCategory.CONNECTION:
+            logger.warning("IBKRClient [conn %d]: reqId=%d  %s", error_code, req_id, error_str)
+        elif category is ErrorCategory.MARKET_DATA:
+            logger.warning("IBKRClient [mkt %d]: reqId=%d  %s", error_code, req_id, error_str)
+        elif category is ErrorCategory.PACING:
+            logger.warning("IBKRClient [pace %d]: reqId=%d  %s", error_code, req_id, error_str)
         else:
             logger.error(
-                "IBKRClient [err %d]: reqId=%d  %s  advanced=%s",
+                "IBKRClient [err %d/%s]: reqId=%d  %s  advanced=%s",
                 error_code,
+                category.value,
                 req_id,
                 error_str,
                 advanced_order_reject or "",

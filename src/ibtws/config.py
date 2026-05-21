@@ -54,6 +54,19 @@ class IBKRConfig:
 
     watchdog_enabled: bool = True
 
+    # --- quote freshness (options strategies) ---
+    quote_max_age_s: float = 5.0
+    """Maximum age (seconds) a Ticker timestamp may have before it is treated as
+    stale and discarded. Tight default targets 0DTE; relax for slower strategies."""
+
+    stale_quote_circuit_break: int = 5
+    """Consecutive stale/missing-quote polls in a strategy monitor loop that
+    trip the circuit breaker (logged at ERROR; loop may escalate)."""
+
+    auto_flatten_on_mismatch: bool = True
+    """When True, OrderManager will market-flatten orphan legs after a BAG
+    combo fill if the resulting position mismatch is detected."""
+
     # --- startup fetch flags ---
     fetch_fields: StartupFetch = (
         StartupFetch.POSITIONS

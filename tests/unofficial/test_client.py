@@ -267,17 +267,20 @@ def test_run_sync_disconnects_on_error(fast_config, patch_ib):
 @pytest.mark.parametrize(
     "code,expected_level",
     [
+        # 1100/1300 → CONNECTION → WARNING
         (1100, logging.WARNING),
         (1300, logging.WARNING),
-        (2100, logging.WARNING),
-        (2200, logging.WARNING),
-        # Codes 2104/2106/2158 fall inside the 2100-2200 warning range,
-        # so they are classified as WARNING (the explicit DEBUG set is for
-        # codes outside that range, e.g. nothing currently matches it).
-        (2104, logging.WARNING),
-        (2158, logging.WARNING),
+        # 2100-2200 → INFO (farm-status, advisory pings) → DEBUG
+        (2100, logging.DEBUG),
+        (2200, logging.DEBUG),
+        (2104, logging.DEBUG),
+        (2158, logging.DEBUG),
+        # ORDER (200-299) → ERROR
         (200, logging.ERROR),
-        (321, logging.ERROR),
+        # MARKET_DATA (300-399) → WARNING
+        (321, logging.WARNING),
+        # PACING (100) → WARNING
+        (100, logging.WARNING),
     ],
 )
 def test_handle_error_log_level(client, caplog, code, expected_level):

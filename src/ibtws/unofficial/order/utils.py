@@ -36,7 +36,16 @@ def validate_request(request: Any) -> None:
         raise ValueError(f"Unsupported request type: {type(request).__name__}")
 
     contract = getattr(request, "contract", None)
-    if contract is None or not getattr(contract, "conId", 0):
+    if contract is None:
+        raise ValueError("Contract must be set on the request.")
+    # BAG (combo) contracts intentionally carry conId == 0 — the conIds live on
+    # the comboLegs. Accept them iff they have at least one leg with a non-zero
+    # conId. Everything else must be a fully-qualified single-leg contract.
+    if getattr(contract, "secType", "") == "BAG":
+        combo_legs = getattr(contract, "comboLegs", None) or []
+        if not combo_legs or any(not getattr(leg, "conId", 0) for leg in combo_legs):
+            raise ValueError("BAG contract must have at least one combo leg with a non-zero conId.")
+    elif not getattr(contract, "conId", 0):
         raise ValueError("Contract must be qualified (non-zero conId).")
 
     if not isinstance(request.side, OrderSide):
@@ -45,8 +54,13 @@ def validate_request(request: Any) -> None:
     if request.quantity is None or request.quantity <= 0:
         raise ValueError(f"quantity must be positive, got {request.quantity!r}")
 
-    if isinstance(request, LimitRequest) and request.limit_price <= 0:
-        raise ValueError(f"limit_price must be positive, got {request.limit_price!r}")
+    if isinstance(request, LimitRequest):
+        # BAG combo limits are *signed net cost* (negative = credit, positive =
+        # debit) and may legitimately be zero or negative. Single-leg limits
+        # are always positive prices.
+        is_bag = getattr(contract, "secType", "") == "BAG"
+        if not is_bag and request.limit_price <= 0:
+            raise ValueError(f"limit_price must be positive, got {request.limit_price!r}")
     if isinstance(request, StopRequest) and request.stop_price <= 0:
         raise ValueError(f"stop_price must be positive, got {request.stop_price!r}")
     if isinstance(request, BracketRequest):

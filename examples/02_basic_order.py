@@ -14,6 +14,7 @@ Sections:
   7. Refresh positions from IB (positionEvent can lag a fill)
   8. Close positions — by conId + close_all_positions
   9. Persistence — replay the audit log
+ 10. Current PnL — on-demand unrealized PnL for open positions
 
 Audit log: ``orders.jsonl`` (created next to this file).
 """
@@ -37,14 +38,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 
 async def main() -> None:
-    config = IBKRConfig(port=7497, client_id=14)
-    store = JsonStore(Path(__file__).parent / "orders.jsonl")
+    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)
+    store = JsonStore(Path(__file__).parent.parent / "output" / "orders.jsonl")
 
     async with IBKRClient(config) as client:
         await client.connect()
         client.ib.reqMarketDataType(2)  # delayed-frozen — fine for paper
 
-        underlying = ContFuture("ES", exchange="CME", currency="USD")
+        underlying = ContFuture("MES", exchange="CME", currency="USD")
         [underlying] = await client.qualify(underlying)
 
         manager = OrderManager(client, store)
@@ -139,6 +140,27 @@ async def main() -> None:
         # print(f"audit log: {len(events)} events")
         # for e in events[-5:]:
         #     print(f"  {type(e).__name__}: {e}")
+
+        # ── Section 10 — Current PnL (on-demand unrealized PnL) ─────────────────
+        # One batched snapshot of every open position; returns PositionPnL list.
+        # market_price / market_value / unrealized_pnl are None when no quote is
+        # available (after-hours, missing market-data sub, snapshot timeout) —
+        # treat None as "unknown", never as 0.0.
+        pnls = await manager.current_pnl()
+        # # Filter to a subset by conId if you don't want to quote everything:
+        # # pnls = await manager.current_pnl(con_ids=[underlying.conId])
+        total = 0.0
+        for p in pnls:
+            sym = p.contract.get("localSymbol") or p.contract.get("symbol")
+            if p.unrealized_pnl is None:
+                print(f"  {sym:<20s} qty={p.quantity:+g}  mark=unpriced  cost_basis={p.cost_basis:.2f}")
+            else:
+                total += p.unrealized_pnl
+                print(
+                    f"  {sym:<20s} qty={p.quantity:+g}  mark={p.market_price:.4f}  "
+                    f"value={p.market_value:.2f}  uPnL={p.unrealized_pnl:+.2f}"
+                )
+        print(f"current_pnl total uPnL: {total:+.2f}")
 
         # If Section 4's stream task is running, cancel it before stop():
         # stream_task.cancel()
