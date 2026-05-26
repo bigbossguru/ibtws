@@ -114,6 +114,8 @@ class OrderManager:
 
         self._executor = executor or ThrottledExecutor(max_concurrency=max_concurrency, pace_per_sec=pace_per_sec)
 
+        self._persist_queue: asyncio.Queue[OrderEvent] = asyncio.Queue()
+        self._persist_task: Optional[asyncio.Task] = None
         self._started = False
 
     # ------------------------------------------------------------------
@@ -192,6 +194,7 @@ class OrderManager:
                 self._position_contracts[conid] = p.contract
 
         self._started = True
+        self._persist_task = asyncio.ensure_future(self._persist_worker())
         logger.info(f"OrderManager: started (account={primary}, tracked={len(self._tracked)})")
         return report
 
@@ -202,6 +205,15 @@ class OrderManager:
         self._client.ib.execDetailsEvent -= self._on_exec_details
         self._client.ib.positionEvent -= self._on_position
         self._started = False
+        # Drain pending persist writes before shutting down.
+        if self._persist_task is not None:
+            await self._persist_queue.join()
+            self._persist_task.cancel()
+            try:
+                await self._persist_task
+            except asyncio.CancelledError:
+                pass
+            self._persist_task = None
         logger.info("OrderManager: stopped.")
 
     # ------------------------------------------------------------------
@@ -737,15 +749,20 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     def _dispatch(self, event: OrderEvent) -> None:
-        """Persist + publish. Persist failures are logged, not raised."""
-        asyncio.ensure_future(self._persist_safely(event))
+        """Enqueue for persistence + publish immediately to subscribers."""
+        self._persist_queue.put_nowait(event)
         self._monitor.publish(event)
 
-    async def _persist_safely(self, event: OrderEvent) -> None:
-        try:
-            await self._store.append(event)
-        except Exception:
-            logger.exception(f"OrderManager: failed to persist {type(event).__name__}")
+    async def _persist_worker(self) -> None:
+        """Background task that drains the persist queue sequentially."""
+        while True:
+            event = await self._persist_queue.get()
+            try:
+                await self._store.append(event)
+            except Exception:
+                logger.exception(f"OrderManager: failed to persist {type(event).__name__}")
+            finally:
+                self._persist_queue.task_done()
 
     def _uuid_lock(self, uuid: str) -> asyncio.Lock:
         return self._uuid_locks[uuid]

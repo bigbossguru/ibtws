@@ -54,7 +54,7 @@ async def main() -> None:
         ]
 
         for u in underlyings:
-            [u] = await client.qualify(u)
+            [u] = await client.ib.qualifyContractsAsync(u)
             result = await calculator.calculate(u, lookback_days=252, use_rth=False)
             _print(result)
 

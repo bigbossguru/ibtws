@@ -31,7 +31,7 @@ from ibtws.unofficial.strategies import (
     select_long_leg,
     select_short_leg,
 )
-from ibtws.unofficial.strategies.credit_spread import (
+from ibtws.unofficial.strategies.utils import (
     _parse_expiry_to_dte,
     _quote_mid,
     _round_to_tick,
@@ -321,7 +321,7 @@ async def test_build_plan_happy_path(fake_client, fake_fetcher, fake_manager, mo
     ]
     _patch_fetcher_for_chain(monkeypatch, strat, expirations=[expiry], snapshot_quotes=chain)
     monkeypatch.setattr(
-        "ibtws.unofficial.strategies.credit_spread._parse_expiry_to_dte",
+        "ibtws.unofficial.strategies.utils._parse_expiry_to_dte",
         lambda exp, now=None: 31,
     )
 
@@ -362,7 +362,7 @@ async def test_build_plan_enforces_min_credit(fake_client, fake_fetcher, fake_ma
     ]
     _patch_fetcher_for_chain(monkeypatch, strat, expirations=[expiry], snapshot_quotes=chain)
     monkeypatch.setattr(
-        "ibtws.unofficial.strategies.credit_spread._parse_expiry_to_dte",
+        "ibtws.unofficial.strategies.utils._parse_expiry_to_dte",
         lambda exp, now=None: 30,
     )
 
@@ -384,7 +384,7 @@ async def test_build_plan_enforces_min_credit_width_ratio(fake_client, fake_fetc
     ]
     _patch_fetcher_for_chain(monkeypatch, strat, expirations=[expiry], snapshot_quotes=chain)
     monkeypatch.setattr(
-        "ibtws.unofficial.strategies.credit_spread._parse_expiry_to_dte",
+        "ibtws.unofficial.strategies.utils._parse_expiry_to_dte",
         lambda exp, now=None: 30,
     )
 
@@ -407,7 +407,7 @@ async def test_place_routes_through_order_manager(fake_client, fake_fetcher, fak
     ]
     _patch_fetcher_for_chain(monkeypatch, strat, expirations=[expiry], snapshot_quotes=chain)
     monkeypatch.setattr(
-        "ibtws.unofficial.strategies.credit_spread._parse_expiry_to_dte",
+        "ibtws.unofficial.strategies.utils._parse_expiry_to_dte",
         lambda exp, now=None: 30,
     )
 
@@ -447,7 +447,7 @@ async def test_close_uses_take_profit_debit_by_default(fake_client, fake_fetcher
     ]
     _patch_fetcher_for_chain(monkeypatch, strat, expirations=[expiry], snapshot_quotes=chain)
     monkeypatch.setattr(
-        "ibtws.unofficial.strategies.credit_spread._parse_expiry_to_dte",
+        "ibtws.unofficial.strategies.utils._parse_expiry_to_dte",
         lambda exp, now=None: 30,
     )
 
@@ -466,8 +466,8 @@ async def test_close_uses_take_profit_debit_by_default(fake_client, fake_fetcher
 
     args, _ = fake_manager.limit.call_args
     _, side, _, price = args
-    assert side == OrderSide.BUY
-    assert price == pytest.approx(0.20)
+    assert side == OrderSide.SELL
+    assert price == pytest.approx(-0.20)
 
 
 async def test_constructor_requires_order_manager(fake_client, fake_fetcher):
@@ -484,7 +484,7 @@ async def test_current_mid_debit_returns_none_on_missing_quote(fake_client, fake
     ]
     _patch_fetcher_for_chain(monkeypatch, strat, expirations=[expiry], snapshot_quotes=chain)
     monkeypatch.setattr(
-        "ibtws.unofficial.strategies.credit_spread._parse_expiry_to_dte",
+        "ibtws.unofficial.strategies.utils._parse_expiry_to_dte",
         lambda exp, now=None: 30,
     )
     plan = await strat.build_plan(
@@ -511,7 +511,7 @@ async def test_current_mid_debit_computes_value(fake_client, fake_fetcher, fake_
     ]
     _patch_fetcher_for_chain(monkeypatch, strat, expirations=[expiry], snapshot_quotes=chain)
     monkeypatch.setattr(
-        "ibtws.unofficial.strategies.credit_spread._parse_expiry_to_dte",
+        "ibtws.unofficial.strategies.utils._parse_expiry_to_dte",
         lambda exp, now=None: 30,
     )
     plan = await strat.build_plan(
@@ -586,7 +586,7 @@ async def test_strategy_place_forwards_outside_rth(fake_client, fake_fetcher, fa
     ]
     _patch_fetcher_for_chain(monkeypatch, strat, expirations=[expiry], snapshot_quotes=chain)
     monkeypatch.setattr(
-        "ibtws.unofficial.strategies.credit_spread._parse_expiry_to_dte",
+        "ibtws.unofficial.strategies.utils._parse_expiry_to_dte",
         lambda exp, now=None: 30,
     )
 

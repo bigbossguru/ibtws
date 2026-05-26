@@ -227,14 +227,14 @@ async def main() -> None:
         client.ib.reqMarketDataType(2)
 
         underlying = Index("SPX", "CBOE", "USD")
-        [underlying] = await client.qualify(underlying)
+        [underlying] = await client.ib.qualifyContractsAsync(underlying)
 
         manager = OrderManager(client, store)
         await manager.start()
         # Shared fetcher with a tight freshness window so the 15-minute scheduler
         # never acts on a stale 0DTE quote; subscriptions are released by
         # CreditSpreadStrategy.close() to stay under IB's per-session cap.
-        fetcher = OptionChainFetcher(client, quote_max_age_s=5.0)
+        fetcher = OptionChainFetcher(client)
         strat = CreditSpreadStrategy(client, manager, fetcher=fetcher)
 
         # Schedule anchors — pin all times to today in ET.

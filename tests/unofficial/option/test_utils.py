@@ -9,9 +9,8 @@ from ibtws.unofficial.option.utils import (
     _chunked,
     _filter_expirations,
     _filter_strikes,
-    _safe_float,
+    _safe_pick_value,
     _ticker_to_quote,
-    is_quote_fresh,
 )
 
 from .conftest import make_ticker
@@ -26,7 +25,7 @@ def test_chunked_empty_returns_nothing():
 
 
 @pytest.mark.parametrize(
-    "value,expected",
+    "attr_value,expected",
     [
         (1.5, 1.5),
         (None, None),
@@ -35,8 +34,14 @@ def test_chunked_empty_returns_nothing():
         ("3.14", 3.14),
     ],
 )
-def test_safe_float(value, expected):
-    assert _safe_float(value) == expected
+def test_pick_price(attr_value, expected):
+    obj = type("X", (), {"v": attr_value})()
+    assert _safe_pick_value(obj, "v") == expected
+
+
+def test_pick_price_missing_attr_returns_none():
+    obj = type("X", (), {})()
+    assert _safe_pick_value(obj, "missing") is None
 
 
 def test_filter_expirations_explicit_wins_over_range():
@@ -96,41 +101,7 @@ def test_ticker_to_quote_scrubs_nan():
     assert q.bid is None and q.ask is None
 
 
-# ---------------------------------------------------------------------------
-# is_quote_fresh
-# ---------------------------------------------------------------------------
-
-
-class _TickerStub:
-    def __init__(self, **kw):
-        for k, v in kw.items():
-            setattr(self, k, v)
-
-
-def test_is_quote_fresh_disabled_when_max_age_zero():
-    assert is_quote_fresh(_TickerStub(), 0.0) is True
-    assert is_quote_fresh(_TickerStub(), -1.0) is True
-
-
-def test_is_quote_fresh_missing_timestamp_is_not_fresh():
-    # No time / lastTime / bidTime / askTime → cannot verify age → reject.
-    assert is_quote_fresh(_TickerStub(), 5.0) is False
-
-
-def test_is_quote_fresh_within_window():
-    now = 1000.0
-    t = _TickerStub(time=now - 2.0)  # 2s old
-    assert is_quote_fresh(t, max_age_s=5.0, now=now) is True
-
-
-def test_is_quote_fresh_outside_window():
-    now = 1000.0
-    t = _TickerStub(time=now - 10.0)  # 10s old
-    assert is_quote_fresh(t, max_age_s=5.0, now=now) is False
-
-
-def test_is_quote_fresh_uses_most_recent_timestamp():
-    now = 1000.0
-    # bidTime is fresher than time; should win.
-    t = _TickerStub(time=now - 100.0, bidTime=now - 1.0)
-    assert is_quote_fresh(t, max_age_s=5.0, now=now) is True
+def test_ticker_to_quote_propagates_underlying_price():
+    contract = Option(symbol="AAPL", lastTradeDateOrContractMonth="20260116", strike=150, right="C")
+    q = _ticker_to_quote(make_ticker(contract), underlying_price=152.5)
+    assert q.underlying_price == 152.5

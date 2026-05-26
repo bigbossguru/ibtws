@@ -1,27 +1,24 @@
-"""Tests for ``ibtws.unofficial.option.fetcher.OptionChainFetcher``.
+"""Tests for ``ibtws.unofficial.option.chains.OptionChainFetcher``.
 
-Exercises the full pipeline (chain discovery, contract qualification,
-snapshot flow, throttling, error tolerance, DataFrame projection) against
-the fake client defined in ``conftest.py``.
+Exercises chain discovery, contract qualification, the snapshot flow,
+filter behaviour, error tolerance, and DataFrame projection against the
+fake client defined in ``conftest.py``.
 """
 
 from __future__ import annotations
 
-import asyncio
-import time
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
-from ib_async import Option
 
-from ibtws.unofficial.option import ChainDefinition, OptionChainFetcher, OptionQuote
+from ibtws.unofficial.option import ChainDefinition, OptionQuote
 
 from .conftest import async_side, make_chain_param, make_ticker, make_underlying, with_conid
 
 
 def _qualify_options(*contracts):
-    """Stamp a ``conId`` onto each contract — used as ``client.qualify`` side_effect."""
+    """Stamp a ``conId`` onto each contract — used as ``qualifyContractsAsync.side_effect``."""
     for i, c in enumerate(contracts):
         if not getattr(c, "conId", 0):
             c.conId = 1000 + i
@@ -67,10 +64,25 @@ async def test_fetch_chain_definition_falls_back_when_exchange_missing(fetcher, 
     assert definition.exchange == "CBOE"
 
 
+async def test_fetch_chain_definition_filters_by_trading_class(fetcher, fake_client):
+    fake_client.ib.reqSecDefOptParamsAsync.return_value = [
+        make_chain_param(trading_class="SPX"),
+        make_chain_param(trading_class="SPXW"),
+    ]
+    definition = await fetcher.fetch_chain_definition(make_underlying(), trading_class="SPXW")
+    assert definition.trading_class == "SPXW"
+
+
 async def test_fetch_chain_definition_raises_when_empty(fetcher, fake_client):
     fake_client.ib.reqSecDefOptParamsAsync.return_value = []
     with pytest.raises(LookupError):
         await fetcher.fetch_chain_definition(make_underlying())
+
+
+async def test_fetch_chain_definition_raises_when_trading_class_missing(fetcher, fake_client):
+    fake_client.ib.reqSecDefOptParamsAsync.return_value = [make_chain_param(trading_class="SPX")]
+    with pytest.raises(LookupError):
+        await fetcher.fetch_chain_definition(make_underlying(), trading_class="SPXW")
 
 
 async def test_fetch_chain_definition_requires_qualified_underlying(fetcher):
@@ -87,7 +99,7 @@ async def test_fetch_snapshot_full_pipeline(fetcher, fake_client):
     fake_client.ib.reqSecDefOptParamsAsync.return_value = [
         make_chain_param(expirations=("20260116",), strikes=(150.0, 160.0))
     ]
-    fake_client.qualify.side_effect = async_side(_qualify_options)
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(_qualify_options)
     fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
 
     quotes = await fetcher.fetch_snapshot(
@@ -111,7 +123,7 @@ async def test_fetch_snapshot_returns_empty_when_filters_exclude_everything(fetc
         expirations=["20990101"],  # not in chain
     )
     assert quotes == []
-    fake_client.qualify.assert_not_called()
+    fake_client.ib.qualifyContractsAsync.assert_not_called()
     fake_client.ib.reqTickersAsync.assert_not_called()
 
 
@@ -119,7 +131,7 @@ async def test_fetch_snapshot_drops_qualify_failures(fetcher, fake_client):
     fake_client.ib.reqSecDefOptParamsAsync.return_value = [
         make_chain_param(expirations=("20260116",), strikes=(150.0,))
     ]
-    fake_client.qualify.side_effect = RuntimeError("IB no like")
+    fake_client.ib.qualifyContractsAsync.side_effect = RuntimeError("IB no like")
 
     quotes = await fetcher.fetch_snapshot(make_underlying(), expirations=["20260116"], strikes=[150.0])
 
@@ -133,11 +145,11 @@ async def test_fetch_snapshot_drops_unresolved_contracts(fetcher, fake_client):
     ]
 
     def qualify(*contracts):
-        # Only first contract gets a conId.
+        # Only first contract gets a conId — others are returned as-is (unresolved).
         contracts[0].conId = 1
         return list(contracts)
 
-    fake_client.qualify.side_effect = async_side(qualify)
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(qualify)
     fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
 
     quotes = await fetcher.fetch_snapshot(
@@ -150,27 +162,44 @@ async def test_fetch_snapshot_drops_unresolved_contracts(fetcher, fake_client):
     assert len(quotes) == 1
 
 
-async def test_fetch_snapshot_handles_snapshot_timeout(fake_client):
-    f = OptionChainFetcher(fake_client, pace_per_sec=0, snapshot_timeout=0.05)
+async def test_fetch_snapshot_subscribes_and_cancels_market_data(fetcher, fake_client):
     fake_client.ib.reqSecDefOptParamsAsync.return_value = [
         make_chain_param(expirations=("20260116",), strikes=(150.0,))
     ]
-    fake_client.qualify.side_effect = async_side(_qualify_options)
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(_qualify_options)
+    fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
 
-    async def never_returns(*_cs, **_kw):
-        await asyncio.sleep(10)
-        return []
-
-    fake_client.ib.reqTickersAsync.side_effect = never_returns
-
-    quotes = await f.fetch_snapshot(
+    quotes = await fetcher.fetch_snapshot(
         make_underlying(),
         expirations=["20260116"],
         strikes=[150.0],
-        rights=("C",),
+        rights=("C", "P"),
     )
-    # Snapshot timed out — batch is dropped entirely.
-    assert quotes == []
+
+    assert len(quotes) == 2
+    # Each qualified contract gets a reqMktData and a matching cancelMktData.
+    assert fake_client.ib.reqMktData.call_count == 2
+    assert fake_client.ib.cancelMktData.call_count == 2
+
+
+async def test_fetch_snapshot_batches_snapshots(fetcher, fake_client):
+    # 3 strikes × 2 rights = 6 contracts; batch_size=2 ⇒ 3 batches.
+    fake_client.ib.reqSecDefOptParamsAsync.return_value = [
+        make_chain_param(expirations=("20260116",), strikes=(140.0, 150.0, 160.0))
+    ]
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(_qualify_options)
+    fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
+
+    quotes = await fetcher.fetch_snapshot(
+        make_underlying(),
+        expirations=["20260116"],
+        strikes=[140.0, 150.0, 160.0],
+        rights=("C", "P"),
+        batch_size=2,
+    )
+
+    assert len(quotes) == 6
+    assert fake_client.ib.reqTickersAsync.await_count == 3
 
 
 async def test_fetch_snapshot_auto_windows_strikes_around_spot(fetcher, fake_client):
@@ -180,17 +209,12 @@ async def test_fetch_snapshot_auto_windows_strikes_around_spot(fetcher, fake_cli
             strikes=(50.0, 100.0, 140.0, 150.0, 160.0, 200.0, 300.0),
         )
     ]
-
-    underlying_ticker = SimpleNamespace(last=150.0, close=150.0, bid=149.5, ask=150.5, contract=make_underlying())
-
-    async def req_tickers(*cs, **_kw):
-        # Spot lookup: single non-Option contract → return underlying ticker.
-        if len(cs) == 1 and not isinstance(cs[0], Option):
-            return [underlying_ticker]
-        return [make_ticker(c) for c in cs]
-
-    fake_client.ib.reqTickersAsync.side_effect = req_tickers
-    fake_client.qualify.side_effect = async_side(_qualify_options)
+    # Spot lookup hits IBKRClient.get_market_data.
+    fake_client.get_market_data.return_value = SimpleNamespace(
+        last=150.0, close=150.0, bid=149.5, ask=150.5, contract=make_underlying()
+    )
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(_qualify_options)
+    fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
 
     quotes = await fetcher.fetch_snapshot(
         make_underlying(),
@@ -201,24 +225,15 @@ async def test_fetch_snapshot_auto_windows_strikes_around_spot(fetcher, fake_cli
 
     # Spot 150 ±20% => [120, 180] — only 140, 150, 160 should survive.
     assert {q.contract.strike for q in quotes} == {140.0, 150.0, 160.0}
+    fake_client.get_market_data.assert_awaited_once()
 
 
 async def test_fetch_snapshot_skips_window_when_explicit_strikes(fetcher, fake_client):
     fake_client.ib.reqSecDefOptParamsAsync.return_value = [
         make_chain_param(expirations=("20260116",), strikes=(140.0, 150.0, 300.0))
     ]
-    fake_client.qualify.side_effect = async_side(lambda *cs: [with_conid(c, 1) for c in cs])
-
-    spot_calls = 0
-
-    async def req_tickers(*cs, **_kw):
-        nonlocal spot_calls
-        if len(cs) == 1 and not isinstance(cs[0], Option):
-            spot_calls += 1
-            return []
-        return [make_ticker(c) for c in cs]
-
-    fake_client.ib.reqTickersAsync.side_effect = req_tickers
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(lambda *cs: [with_conid(c, 1) for c in cs])
+    fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
 
     quotes = await fetcher.fetch_snapshot(
         make_underlying(),
@@ -227,15 +242,13 @@ async def test_fetch_snapshot_skips_window_when_explicit_strikes(fetcher, fake_c
         rights=("C",),
     )
     assert {q.contract.strike for q in quotes} == {300.0}
-    assert spot_calls == 0
+    fake_client.get_market_data.assert_not_called()
 
 
-async def test_fetch_snapshot_qualifies_underlying_if_needed(fake_client):
-    f = OptionChainFetcher(fake_client, pace_per_sec=0)
+async def test_fetch_snapshot_qualifies_underlying_if_needed(fake_client, fetcher):
     fake_client.ib.reqSecDefOptParamsAsync.return_value = [
         make_chain_param(expirations=("20260116",), strikes=(150.0,))
     ]
-
     qualified_underlying = make_underlying(con_id=12345)
 
     def qualify(*contracts):
@@ -244,21 +257,23 @@ async def test_fetch_snapshot_qualifies_underlying_if_needed(fake_client):
             return [qualified_underlying]
         return _qualify_options(*contracts)
 
-    fake_client.qualify.side_effect = async_side(qualify)
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(qualify)
     fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
 
     unqualified = make_underlying(con_id=0)
-    quotes = await f.fetch_snapshot(unqualified, expirations=["20260116"], strikes=[150.0], rights=("C",))
+    quotes = await fetcher.fetch_snapshot(unqualified, expirations=["20260116"], strikes=[150.0], rights=("C",))
 
-    fake_client.qualify.assert_any_await(unqualified)
     assert len(quotes) == 1
+    # The first qualify call gets the unqualified underlying.
+    first_call_args = fake_client.ib.qualifyContractsAsync.await_args_list[0].args
+    assert first_call_args == (unqualified,)
 
 
 async def test_fetch_snapshot_as_dataframe_returns_dataframe(fetcher, fake_client):
     fake_client.ib.reqSecDefOptParamsAsync.return_value = [
         make_chain_param(expirations=("20260116",), strikes=(150.0,))
     ]
-    fake_client.qualify.side_effect = async_side(_qualify_options)
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(_qualify_options)
     fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
 
     df = await fetcher.fetch_snapshot(
@@ -274,29 +289,3 @@ async def test_fetch_snapshot_as_dataframe_returns_dataframe(fetcher, fake_clien
     assert df["symbol"].iloc[0] == "AAPL"
     assert df["strike"].iloc[0] == 150.0
     assert df["right"].iloc[0] == "C"
-
-
-# ---------------------------------------------------------------------------
-# Pacing
-# ---------------------------------------------------------------------------
-
-
-async def test_pacing_enforces_minimum_interval(fake_client):
-    f = OptionChainFetcher(fake_client, pace_per_sec=20)  # 50 ms apart
-    fake_client.ib.reqSecDefOptParamsAsync.return_value = [make_chain_param()]
-
-    underlying = make_underlying()
-    start = time.monotonic()
-    await f.fetch_chain_definition(underlying)
-    await f.fetch_chain_definition(underlying)
-    await f.fetch_chain_definition(underlying)
-    elapsed = time.monotonic() - start
-
-    # Two intervals between three calls => at least 100 ms (allow scheduler slack).
-    assert elapsed >= 0.09
-
-
-async def test_pacing_disabled_when_pace_zero(fake_client):
-    f = OptionChainFetcher(fake_client, pace_per_sec=0)
-    assert f._min_interval == 0
-    await f._await_next_slot()

@@ -95,8 +95,8 @@ def fake_client():
 
 @pytest.fixture
 def fake_fetcher(fake_client):
-    """Fetcher with pacing disabled — selection tests bypass it via patching."""
-    return OptionChainFetcher(fake_client, max_concurrency=10, pace_per_sec=0, snapshot_timeout=1.0)
+    """Fetcher used by strategy tests; selection tests bypass it via patching."""
+    return OptionChainFetcher(fake_client)
 
 
 @pytest.fixture

@@ -46,7 +46,7 @@ async def main() -> None:
         client.ib.reqMarketDataType(2)  # delayed-frozen — fine for paper
 
         underlying = ContFuture("MES", exchange="CME", currency="USD")
-        [underlying] = await client.qualify(underlying)
+        [underlying] = await client.ib.qualifyContractsAsync(underlying)
 
         manager = OrderManager(client, store)
 

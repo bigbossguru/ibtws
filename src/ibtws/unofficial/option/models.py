@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import time
+import datetime as _dt
 from dataclasses import dataclass, field
-from typing import Optional
 
 from ib_async import Option
 
@@ -27,17 +27,32 @@ class OptionQuote:
     """Snapshot of one option contract's market metrics at a point in time."""
 
     contract: Option
-    bid: Optional[float] = None
-    ask: Optional[float] = None
-    volume: Optional[float] = None
-    open_interest: Optional[float] = None
+    bid: float | None = None
+    ask: float | None = None
+    volume: float | None = None
+    open_interest: float | None = None
 
     # From modelGreeks (preferred — uses IB's pricing model with current vol surface).
-    iv: Optional[float] = None
-    delta: Optional[float] = None
-    gamma: Optional[float] = None
-    vega: Optional[float] = None
-    theta: Optional[float] = None
-    underlying_price: Optional[float] = None
+    iv: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    vega: float | None = None
+    theta: float | None = None
+    underlying_price: float | None = None
 
     timestamp: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
+class IVRankResult:
+    """Result of an IV Rank / IV Percentile computation for one underlying."""
+
+    underlying_symbol: str
+    as_of: _dt.date | None
+    current_iv: float | None
+    min_iv: float | None
+    max_iv: float | None
+    iv_rank: float | None  # 0..100, or None when the band is degenerate
+    iv_percentile: float | None  # 0..100
+    sample_size: int
+    lookback_days: int

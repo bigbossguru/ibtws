@@ -1,12 +1,14 @@
 """High-level option strategies built on top of the order & option layers."""
 
-from .credit_spread import (
-    CreditSpreadError,
+from .credit_spread import CreditSpreadStrategy
+from .models import (
     CreditSpreadParams,
     CreditSpreadPlan,
-    CreditSpreadStrategy,
     SpreadLeg,
     SpreadType,
+)
+from .utils import (
+    CreditSpreadError,
     select_expiry,
     select_long_leg,
     select_short_leg,

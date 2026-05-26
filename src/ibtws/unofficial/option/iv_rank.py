@@ -21,32 +21,15 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
-from dataclasses import dataclass
-from typing import Optional
 
 from ib_async import Contract
 
 from ibtws.unofficial.client import IBKRClient
-
-from .utils import _safe_float
+from .utils import _safe_pick_value
+from .models import IVRankResult
 
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class IVRankResult:
-    """Result of an IV Rank / IV Percentile computation for one underlying."""
-
-    underlying_symbol: str
-    as_of: Optional[_dt.date]
-    current_iv: Optional[float]
-    min_iv: Optional[float]
-    max_iv: Optional[float]
-    iv_rank: Optional[float]  # 0..100, or None when the band is degenerate
-    iv_percentile: Optional[float]  # 0..100
-    sample_size: int
-    lookback_days: int
 
 
 class IVRankCalculator:
@@ -64,10 +47,6 @@ class IVRankCalculator:
     ) -> None:
         self._client = client
         self._timeout = request_timeout
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     async def calculate(
         self,
@@ -92,7 +71,7 @@ class IVRankCalculator:
             Restrict to Regular Trading Hours bars (recommended).
         """
         if not underlying.conId:
-            (underlying,) = await self._client.qualify(underlying)
+            (underlying,) = await self._client.ib.qualifyContractsAsync(underlying)
 
         duration = f"{max(1, int(lookback_days))} D"
         logger.info(f"IVRankCalculator: requesting {duration} of OPTION_IMPLIED_VOLATILITY for {underlying.symbol}")
@@ -116,7 +95,7 @@ class IVRankCalculator:
         ivs: list[float] = []
         dates: list[_dt.date] = []
         for bar in bars or []:
-            v = _safe_float(getattr(bar, "close", None))
+            v = _safe_pick_value(bar, "close")
             if v is None or v <= 0:
                 continue
             ivs.append(v)
