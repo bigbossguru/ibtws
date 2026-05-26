@@ -12,7 +12,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from ibtws.unofficial.option import IVRankCalculator, IVRankResult
+from ibtws.unofficial.option import IVRankCalculator
+from ibtws.unofficial.option.models import IVRankResult
 
 from .conftest import make_underlying
 
@@ -83,11 +84,11 @@ async def test_calculate_qualifies_unqualified_underlying(calc, fake_client, his
     hist_mock.return_value = [_bar(0.2)]
     unqualified = SimpleNamespace(symbol="AAPL", conId=0, secType="STK")
     qualified = make_underlying()
-    fake_client.qualify.return_value = [qualified]
+    fake_client.ib.qualifyContractsAsync.return_value = [qualified]
 
     await calc.calculate(unqualified)
 
-    fake_client.qualify.assert_awaited_once()
+    fake_client.ib.qualifyContractsAsync.assert_awaited_once_with(unqualified)
     # The qualified contract should be the one sent to IB.
     assert hist_mock.await_args.args[0] is qualified
 

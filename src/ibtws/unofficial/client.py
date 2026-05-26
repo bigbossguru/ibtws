@@ -1,485 +1,151 @@
 # Non-official package. This is not an official package and may not be maintained by the original authors of ib_async.
-
-"""
-A simple, robust and resilient IBKR TWS/Gateway client built on ib_async 2.1.0.
-
-Design goals
-------------
-* Single responsibility  – thin connection/lifecycle layer only.
-* Auto-reconnect         – exponential back-off with configurable ceiling.
-* Health monitoring      – periodic watchdog that detects silent disconnects.
-* Structured logging     – every state transition is logged, never silently swallowed.
-* Async-first            – all public methods are coroutines; a blocking helper is
-                           provided for scripts that do not manage their own event loop.
-* Resource-safe          – context-manager support guarantees clean teardown.
-
-Usage (async)
--------------
-    async with IBKRClient() as client:
-        await client.connect()
-        positions = await client.ib.reqPositionsAsync()
-
-Usage (sync / script)
----------------------
-    client = IBKRClient()
-    client.run_sync(my_async_main(client))
-"""
-
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
-import math
-import random
-import time
-from typing import Callable, Optional
+from typing import Literal
 
-from ib_async import IB, Contract
+import pandas as pd
+from ib_async import IB, Contract, Ticker, util
 
 from ibtws.config import IBKRConfig
-from ibtws.unofficial._ib_errors import ErrorCategory, classify
+
 
 logger = logging.getLogger(__name__)
 
+# Bar size strings accepted by IBKR's reqHistoricalData.
+BarSize = Literal[
+    "1 secs",
+    "5 secs",
+    "10 secs",
+    "15 secs",
+    "30 secs",
+    "1 min",
+    "2 mins",
+    "3 mins",
+    "5 mins",
+    "10 mins",
+    "15 mins",
+    "20 mins",
+    "30 mins",
+    "1 hour",
+    "2 hours",
+    "3 hours",
+    "4 hours",
+    "8 hours",
+    "1 day",
+    "1 week",
+    "1 month",
+]
 
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
+# Common duration presets. Any `"<int> <S|D|W|M|Y>"` string is also valid.
+Duration = Literal[
+    "60 S",
+    "300 S",
+    "1800 S",
+    "3600 S",
+    "1 D",
+    "5 D",
+    "10 D",
+    "30 D",
+    "1 W",
+    "4 W",
+    "1 M",
+    "3 M",
+    "6 M",
+    "1 Y",
+    "2 Y",
+    "5 Y",
+    "10 Y",
+]
 
 
 class IBKRClient:
-    """
-    Lifecycle wrapper around ``ib_async.IB`` with auto-reconnect and a watchdog.
-
-    The raw ``IB`` instance is exposed as ``self.ib`` so callers can use the full
-    ib_async API without any friction.
-    """
-
-    def __init__(
-        self,
-        config: IBKRConfig,
-        *,
-        on_connected: Optional[Callable[["IBKRClient"], None]] = None,
-        on_disconnected: Optional[Callable[["IBKRClient"], None]] = None,
-        on_error: Optional[Callable[[int, int, str, str], None]] = None,
-    ) -> None:
-        """
-        Build a client and wire it to the underlying ``ib_async.IB`` instance.
-
-        No network I/O happens here — call :meth:`connect` to actually open
-        the socket.
-
-        Parameters
-        ----------
-        config:
-            All tunables (host, port, timeouts, reconnect/watchdog settings).
-        on_connected:
-            Optional sync callback fired from the event-loop thread every time
-            the socket transitions to *connected* (initial connect AND each
-            successful reconnect). Exceptions raised by the hook are logged
-            and swallowed so they cannot break the lifecycle.
-        on_disconnected:
-            Optional sync callback fired from the event-loop thread on every
-            disconnect (clean or unexpected). Same exception policy as above.
-        on_error:
-            Optional sync callback receiving raw IBKR error tuples
-            ``(req_id, error_code, error_str, advanced_order_reject)``. Useful
-            for forwarding errors to a metrics pipeline. Exceptions are logged
-            and swallowed.
-        """
+    def __init__(self, config: IBKRConfig) -> None:
         self.config = config
         self.ib = IB()
         self.ib.RequestTimeout = self.config.request_timeout
         self.ib.RaiseRequestErrors = True
 
-        # User-supplied hooks (called from the event loop thread).
-        self._on_connected = on_connected
-        self._on_disconnected = on_disconnected
-        self._on_error = on_error
-
-        # Internal state.
-        self._reconnect_attempt: int = 0
-        self._connected_at: Optional[float] = None
-        self._watchdog_task: Optional[asyncio.Task] = None
-        self._reconnect_task: Optional[asyncio.Task] = None
-        self._shutting_down: bool = False
-
-        # Wire up ib_async events.
-        self.ib.connectedEvent += self._handle_connected
-        self.ib.disconnectedEvent += self._handle_disconnected
-        self.ib.errorEvent += self._handle_error
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    @property
-    def is_connected(self) -> bool:
-        """
-        Return ``True`` when the underlying socket is live and the API
-        handshake has completed.
-
-        This is a thin pass-through to ``ib_async.IB.isConnected()`` and is
-        safe to poll at any frequency.
-        """
-        return self.ib.isConnected()
-
     async def connect(self) -> None:
-        """
-        Open a connection to TWS / IB Gateway and complete the API handshake.
-
-        Blocks until the socket is live and the initial state sync (positions,
-        orders, etc. — controlled by ``config.fetch_fields``) has finished.
-
-        Raises
-        ------
-        ConnectionError
-            If the TCP handshake times out or any other connect-time error
-            occurs. The original exception is chained via ``__cause__``.
-        """
-        await self._connect_once()
-
-    async def disconnect(self) -> None:
-        """
-        Tear down the connection and stop all background tasks.
-
-        Idempotent and safe to call from any context. Sets the
-        ``_shutting_down`` flag *first* so that the synchronously-fired
-        ``disconnectedEvent`` does not schedule a new reconnect loop. Pending
-        watchdog and reconnect tasks are cancelled and awaited before the
-        socket is closed.
-        """
-        self._shutting_down = True
-        await self._cancel_background_tasks()
         if self.ib.isConnected():
-            self.ib.disconnect()
-            logger.info("IBKRClient: disconnected cleanly.")
-
-    async def qualify(self, *contracts: Contract) -> list[Contract]:
-        """
-        Resolve one or more partially-specified contracts into fully-qualified
-        ones (populating ``conId``, ``primaryExchange``, etc.).
-
-        Parameters
-        ----------
-        *contracts:
-            One or more ``ib_async.Contract`` instances to qualify. Each must
-            carry enough fields (e.g. symbol + secType + exchange + currency)
-            for IBKR to identify it unambiguously.
-
-        Returns
-        -------
-        list[Contract]
-            The same contracts, mutated in-place by ib_async with the resolved
-            fields. Order matches the input.
-
-        Raises
-        ------
-        ValueError
-            If any contract was dropped by IBKR (length mismatch) or returned
-            without a ``conId`` (ambiguous / unknown symbol).
-        """
-        resolved = await self.ib.qualifyContractsAsync(*contracts)
-        if len(resolved) != len(contracts) or any(not c.conId for c in resolved):
-            raise ValueError(f"Could not qualify {len(contracts) - len(resolved)} of {len(contracts)} contracts")
-        return resolved
-
-    # ------------------------------------------------------------------
-    # Context-manager support
-    # ------------------------------------------------------------------
-
-    async def __aenter__(self) -> "IBKRClient":
-        """
-        Enter the async context manager.
-
-        Does NOT auto-connect — call :meth:`connect` explicitly inside the
-        ``async with`` block. This keeps connection failures visible at the
-        call site rather than hidden in the context-manager protocol.
-        """
-        return self
-
-    async def __aexit__(self, *_) -> None:
-        """Exit the async context manager, ensuring :meth:`disconnect` runs."""
-        await self.disconnect()
-
-    # ------------------------------------------------------------------
-    # Blocking helper (for scripts without an explicit event loop)
-    # ------------------------------------------------------------------
-
-    def run_sync(self, coro) -> None:
-        """
-        Run *coro* to completion inside a fresh ``asyncio`` event loop.
-
-        Connects before the coroutine runs and disconnects in a ``finally``
-        block, so the socket is always closed cleanly even if *coro* raises.
-        Intended for one-shot scripts that do not manage their own event loop;
-        do NOT call this from code that already runs inside an event loop
-        (use ``await client.connect()`` directly instead).
-
-        Parameters
-        ----------
-        coro:
-            An awaitable representing the user's main logic. It typically
-            uses ``self.ib`` to issue requests.
-        """
-
-        async def _runner():
-            await self.connect()
-            try:
-                await coro
-            finally:
-                await self.disconnect()
-
-        asyncio.run(_runner())
-
-    # ------------------------------------------------------------------
-    # Connection internals
-    # ------------------------------------------------------------------
-
-    async def _connect_once(self) -> None:
-        """
-        Perform exactly one connection attempt, with no retry logic.
-
-        Translates ib_async's raw exceptions into a single ``ConnectionError``
-        so callers (both :meth:`connect` and :meth:`_reconnect_loop`) only
-        need to handle one error type.
-
-        Raises
-        ------
-        ConnectionError
-            On timeout or any other connection failure. Original exception
-            is chained via ``__cause__``.
-        """
+            return
         cfg = self.config
         logger.info(
-            "IBKRClient: connecting to %s:%d (clientId=%d) …",
+            "IBKRClient: connecting to %s:%s (clientId=%s)...",
             cfg.host,
             cfg.port,
             cfg.client_id,
         )
-        try:
-            await self.ib.connectAsync(
-                host=cfg.host,
-                port=cfg.port,
-                clientId=cfg.client_id,
-                timeout=cfg.connect_timeout,
-                readonly=cfg.readonly,
-                account=cfg.account,
-                fetchFields=cfg.fetch_fields,
-            )
-        except asyncio.TimeoutError as exc:
-            raise ConnectionError(
-                f"Timed out connecting to {cfg.host}:{cfg.port} after {cfg.connect_timeout}s"
-            ) from exc
-        except Exception as exc:
-            raise ConnectionError(f"Failed to connect to {cfg.host}:{cfg.port}: {exc}") from exc
-
-    async def _reconnect_loop(self) -> None:
-        """
-        Background task that retries connection with exponential back-off.
-
-        Spawned by :meth:`_handle_disconnected` after an unexpected drop. The
-        delay between attempts doubles each time, capped at
-        ``config.reconnect_max_delay`` and decorated with ±10 % jitter to
-        prevent thundering-herd behaviour when many clients restart together.
-
-        Exits when one of the following becomes true:
-
-        * the connection is re-established (resets the attempt counter to 0);
-        * :attr:`_shutting_down` is set (graceful shutdown in progress);
-        * ``config.reconnect_max_attempts`` is exceeded (only when non-zero).
-        """
-        cfg = self.config
-        while not self._shutting_down:
-            self._reconnect_attempt += 1
-            if cfg.reconnect_max_attempts and self._reconnect_attempt > cfg.reconnect_max_attempts:
-                logger.error(
-                    "IBKRClient: exceeded maximum reconnect attempts (%d). Giving up.",
-                    cfg.reconnect_max_attempts,
-                )
-                return
-
-            delay = min(
-                cfg.reconnect_base_delay * (2 ** (self._reconnect_attempt - 1)),
-                cfg.reconnect_max_delay,
-            )
-            # Add ±10 % jitter to avoid thundering herd if multiple clients restart.
-            delay *= 0.9 + 0.2 * random.random()
-            delay = math.ceil(delay)
-
-            logger.info(
-                "IBKRClient: reconnect attempt %d in %ds …",
-                self._reconnect_attempt,
-                delay,
-            )
-            await asyncio.sleep(delay)
-
-            if self._shutting_down:
-                return
-
-            try:
-                await self._connect_once()
-                logger.info("IBKRClient: reconnected on attempt %d.", self._reconnect_attempt)
-                self._reconnect_attempt = 0
-                return
-            except ConnectionError as exc:
-                logger.warning("IBKRClient: reconnect attempt %d failed – %s", self._reconnect_attempt, exc)
-
-    async def _cancel_background_tasks(self) -> None:
-        """
-        Cancel and await both the watchdog and reconnect tasks if running.
-
-        Swallows any exception (including ``CancelledError``) raised during
-        task teardown — by the time this is called we are tearing down anyway,
-        so further error propagation would only obscure shutdown.
-        """
-        for task in (self._watchdog_task, self._reconnect_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except BaseException:
-                    pass
-        self._watchdog_task = None
-        self._reconnect_task = None
-
-    # ------------------------------------------------------------------
-    # Watchdog
-    # ------------------------------------------------------------------
-
-    async def _watchdog(self) -> None:
-        """
-        Background task that probes liveness by calling ``reqCurrentTimeAsync``.
-
-        ib_async fires ``disconnectedEvent`` on clean TCP closes, but a silent
-        network failure (e.g. NAT timeout, dropped Wi-Fi) can leave the socket
-        half-open with no event delivered. The watchdog catches that case: if
-        the ping times out or errors, it calls ``ib.disconnect()``, which
-        synchronously triggers :meth:`_handle_disconnected` → reconnect loop.
-
-        Loops every ``config.watchdog_interval`` seconds with a fixed 10 s
-        ping timeout. Exits cleanly when :attr:`_shutting_down` is set.
-        """
-        interval = self.config.watchdog_interval
-        while not self._shutting_down:
-            await asyncio.sleep(interval)
-            if self._shutting_down:
-                return
-            if not self.ib.isConnected():
-                logger.warning("IBKRClient: watchdog – not connected, skipping ping.")
-                continue
-            try:
-                await asyncio.wait_for(self.ib.reqCurrentTimeAsync(), timeout=10.0)
-                logger.debug("IBKRClient: watchdog ping OK.")
-            except Exception as exc:
-                logger.warning("IBKRClient: watchdog ping failed – %s. Forcing reconnect.", exc)
-                self.ib.disconnect()
-                # _handle_disconnected will schedule the reconnect loop.
-
-    # ------------------------------------------------------------------
-    # Event handlers
-    # ------------------------------------------------------------------
-
-    def _handle_connected(self) -> None:
-        """
-        ``connectedEvent`` callback — runs on the event-loop thread.
-
-        Records the connection timestamp (used for uptime reporting), cancels
-        any in-flight reconnect task, (re)starts the watchdog if enabled, and
-        invokes the user-supplied ``on_connected`` hook with exceptions
-        contained.
-        """
-        self._connected_at = time.monotonic()
-        logger.info(
-            "IBKRClient: connected – account=%s  server_version=%s",
-            self.ib.wrapper.accounts,
-            self.ib.client.serverVersion(),
+        await self.ib.connectAsync(
+            host=cfg.host,
+            port=cfg.port,
+            clientId=cfg.client_id,
+            timeout=cfg.connect_timeout,
+            readonly=cfg.readonly,
+            account=cfg.account,
+            fetchFields=cfg.fetch_fields,
         )
-        # Cancel any in-flight reconnect loop.
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
-            self._reconnect_task = None
+        logger.info("IBKRClient: connected successfully.")
 
-        # Start / restart the watchdog.
-        if self.config.watchdog_enabled:
-            if self._watchdog_task and not self._watchdog_task.done():
-                self._watchdog_task.cancel()
-            self._watchdog_task = asyncio.ensure_future(self._watchdog())
+    async def disconnect(self) -> None:
+        if self.ib.isConnected():
+            self.ib.disconnect()
+            logger.info("IBKRClient: disconnected cleanly.")
 
-        if self._on_connected:
-            try:
-                self._on_connected(self)
-            except Exception:
-                logger.exception("IBKRClient: on_connected hook raised.")
+    async def get_market_data(self, contract: Contract) -> Ticker:
+        await self.ib.qualifyContractsAsync(contract)
+        self.ib.reqMktData(contract, genericTickList="100,101,104,106")
+        await asyncio.sleep(1.0)  # give IB some time to respond with the tick data
+        tickers = await self.ib.reqTickersAsync(contract)
+        self.ib.cancelMktData(contract)
+        if not tickers:
+            raise LookupError(f"No ticker data returned for {contract.symbol} (conId={contract.conId})")
+        return tickers[0]
 
-    def _handle_disconnected(self) -> None:
+    async def get_historical_data(
+        self,
+        contract: Contract,
+        duration: Duration,
+        bar_size: BarSize,
+        *,
+        use_rth: bool = True,
+        end_datetime: datetime.datetime | datetime.date | str | None = None,
+        what_to_show: Literal[
+            "TRADES",
+            "MIDPOINT",
+            "BID",
+            "ASK",
+            "BID_ASK",
+            "ADJUSTED_LAST",
+            "HISTORICAL_VOLATILITY",
+            "OPTION_IMPLIED_VOLATILITY",
+            "YIELD_BID",
+            "YIELD_ASK",
+            "YIELD_BID_ASK",
+            "YIELD_LAST",
+        ] = "TRADES",
+    ) -> pd.DataFrame | None:
+        """Fetch historical bars for ``contract``.
+
+        Thin async wrapper around :meth:`ib_async.IB.reqHistoricalDataAsync`.
         """
-        ``disconnectedEvent`` callback — runs on the event-loop thread.
+        await self.ib.qualifyContractsAsync(contract)
+        data = await self.ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime=end_datetime,
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+        )
+        df = util.df(data)
+        return df if df is not None else pd.DataFrame()
 
-        Logs the session uptime, clears the connection timestamp, invokes the
-        user ``on_disconnected`` hook, and — unless we are in the middle of a
-        graceful shutdown — schedules :meth:`_reconnect_loop` to start
-        retrying. A new reconnect task is only spawned if no prior one is
-        still alive, to prevent overlapping retries.
-        """
-        uptime = f"{time.monotonic() - self._connected_at:.1f}s" if self._connected_at else "n/a"
-        logger.warning("IBKRClient: disconnected (uptime %s).", uptime)
-        self._connected_at = None
+    async def __aenter__(self) -> "IBKRClient":
+        await self.connect()
+        return self
 
-        if self._on_disconnected:
-            try:
-                self._on_disconnected(self)
-            except Exception:
-                logger.exception("IBKRClient: on_disconnected hook raised.")
-
-        if not self._shutting_down:
-            # Launch reconnect loop if not already running.
-            if not self._reconnect_task or self._reconnect_task.done():
-                self._reconnect_task = asyncio.ensure_future(self._reconnect_loop())
-
-    def _handle_error(self, req_id: int, error_code: int, error_str: str, advanced_order_reject: str) -> None:
-        """``errorEvent`` callback — classifies IBKR error codes by severity.
-
-        Codes are routed through :func:`ibtws.unofficial._ib_errors.classify`
-        so callers can react to category (CONNECTION / MARKET_DATA / ORDER /
-        PACING / INFO) without re-implementing the lookup. Log level is
-        chosen from the category, so noisy infra messages don't drown out
-        real failures.
-
-        Parameters
-        ----------
-        req_id:
-            The request ID the error is attached to, or ``-1`` for global
-            messages.
-        error_code:
-            IBKR numeric error code.
-        error_str:
-            Human-readable error description from TWS.
-        advanced_order_reject:
-            JSON string with extra detail when the error is an order
-            rejection; empty otherwise.
-        """
-        category = classify(error_code)
-        if category is ErrorCategory.INFO:
-            logger.debug("IBKRClient [info %d]: reqId=%d  %s", error_code, req_id, error_str)
-        elif category is ErrorCategory.CONNECTION:
-            logger.warning("IBKRClient [conn %d]: reqId=%d  %s", error_code, req_id, error_str)
-        elif category is ErrorCategory.MARKET_DATA:
-            logger.warning("IBKRClient [mkt %d]: reqId=%d  %s", error_code, req_id, error_str)
-        elif category is ErrorCategory.PACING:
-            logger.warning("IBKRClient [pace %d]: reqId=%d  %s", error_code, req_id, error_str)
-        else:
-            logger.error(
-                "IBKRClient [err %d/%s]: reqId=%d  %s  advanced=%s",
-                error_code,
-                category.value,
-                req_id,
-                error_str,
-                advanced_order_reject or "",
-            )
-
-        if self._on_error:
-            try:
-                self._on_error(req_id, error_code, error_str, advanced_order_reject)
-            except Exception:
-                logger.exception("IBKRClient: on_error hook raised.")
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.disconnect()

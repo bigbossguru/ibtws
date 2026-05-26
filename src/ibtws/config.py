@@ -15,59 +15,30 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class IBKRConfig:
-    """All tunable parameters in one place – no magic numbers scattered in code."""
-
+    # TWS / IB Gateway host.
     host: str = "127.0.0.1"
-    """TWS / IB Gateway host."""
 
+    # TWS / IB Gateway port.
     port: int = 7497
-    """7497 = TWS paper · 7496 = TWS live · 4002 = Gateway paper · 4001 = Gateway live."""
 
+    # TWS / IB Gateway client ID. Must be unique per simultaneous connection to the same TWS instance.
     client_id: int = 1
-    """Must be unique per simultaneous connection to the same TWS instance."""
 
+    # Set to True to disable all order submission methods in the OrderManager.
+    # Useful for "read-only" applications that only want to monitor positions and market data.
     readonly: bool = False
-    """Set True to prevent any order submission."""
 
+    # Optional default account to use for API requests that require an account.
+    # If left blank, TWS will pick the primary account automatically.
     account: str = ""
-    """Leave blank to let TWS pick the primary account automatically."""
 
+    # Time to wait for the initial connection to be established before giving up and raising an error.
     connect_timeout: float = 10.0
-    """Seconds to wait for the initial TCP handshake + sync."""
 
+    # Time to wait for the initial startup fetch (positions, orders, etc.) to complete before giving up and raising an error.
     request_timeout: float = 30.0
-    """Default timeout for blocking API requests."""
 
-    # --- reconnection back-off ---
-    reconnect_base_delay: float = 2.0
-    """Starting delay (seconds) before the first reconnect attempt."""
-
-    reconnect_max_delay: float = 120.0
-    """Upper cap for exponential back-off (seconds)."""
-
-    reconnect_max_attempts: int = 0
-    """0 = retry forever."""
-
-    # --- watchdog ---
-    watchdog_interval: float = 30.0
-    """How often (seconds) the watchdog checks the connection."""
-
-    watchdog_enabled: bool = True
-
-    # --- quote freshness (options strategies) ---
-    quote_max_age_s: float = 5.0
-    """Maximum age (seconds) a Ticker timestamp may have before it is treated as
-    stale and discarded. Tight default targets 0DTE; relax for slower strategies."""
-
-    stale_quote_circuit_break: int = 5
-    """Consecutive stale/missing-quote polls in a strategy monitor loop that
-    trip the circuit breaker (logged at ERROR; loop may escalate)."""
-
-    auto_flatten_on_mismatch: bool = True
-    """When True, OrderManager will market-flatten orphan legs after a BAG
-    combo fill if the resulting position mismatch is detected."""
-
-    # --- startup fetch flags ---
+    # Bitmask of data to fetch on startup. See StartupFetch for available options.
     fetch_fields: StartupFetch = (
         StartupFetch.POSITIONS
         | StartupFetch.ORDERS_OPEN

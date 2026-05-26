@@ -55,7 +55,7 @@ async def main() -> None:
         client.ib.reqMarketDataType(2)  # delayed-frozen — fine for paper / outside RTH
 
         underlying = Index("SPX", "CBOE", "USD")
-        [underlying] = await client.qualify(underlying)
+        [underlying] = await client.ib.qualifyContractsAsync(underlying)
 
         manager = OrderManager(client, store)
         await manager.start()
@@ -63,7 +63,7 @@ async def main() -> None:
         # Tight freshness window — 0DTE moves fast and stale option quotes
         # mis-price the spread. The fetcher drops tickers older than this
         # before they reach the selector.
-        fetcher = OptionChainFetcher(client, quote_max_age_s=5.0)
+        fetcher = OptionChainFetcher(client)
         strat = CreditSpreadStrategy(client, manager, fetcher=fetcher)
 
         # Belt-and-braces: pin the expiry to today's date string. Combined

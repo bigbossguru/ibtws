@@ -78,20 +78,34 @@ def with_conid(contract, con_id: int):
 
 @pytest.fixture
 def fake_client():
-    """Stand-in for IBKRClient exposing only what OptionChainFetcher uses."""
+    """Stand-in for IBKRClient exposing only what the option package uses."""
     ib = MagicMock()
     ib.reqSecDefOptParamsAsync = AsyncMock()
     ib.qualifyContractsAsync = AsyncMock()
     ib.reqTickersAsync = AsyncMock()
-    return SimpleNamespace(ib=ib, qualify=AsyncMock())
+    ib.reqMktData = MagicMock()
+    ib.cancelMktData = MagicMock()
+    return SimpleNamespace(
+        ib=ib,
+        # IVRankCalculator currently calls ``self._client.qualify(...)``;
+        # keep an AsyncMock here so iv_rank tests can wire a side_effect.
+        qualify=AsyncMock(),
+        # OptionChainFetcher._fetch_spot uses IBKRClient.get_market_data().
+        get_market_data=AsyncMock(),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    """Replace the per-batch ``asyncio.sleep`` pauses in chains.py with no-ops."""
+    import ibtws.unofficial.option.chains as chains_module
+
+    async def _instant(_seconds):
+        return None
+
+    monkeypatch.setattr(chains_module.asyncio, "sleep", _instant)
 
 
 @pytest.fixture
 def fetcher(fake_client) -> OptionChainFetcher:
-    """Fetcher with pacing disabled so tests don't pay the 25 ms throttle."""
-    return OptionChainFetcher(
-        fake_client,
-        max_concurrency=10,
-        pace_per_sec=0,
-        snapshot_timeout=1.0,
-    )
+    return OptionChainFetcher(fake_client)

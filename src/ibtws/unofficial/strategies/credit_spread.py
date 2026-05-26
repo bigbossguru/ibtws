@@ -43,431 +43,28 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import time
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional
 
-from ib_async import Bag, ComboLeg, Contract
+from ib_async import Bag, ComboLeg
 
 from ibtws.unofficial.client import IBKRClient
 from ibtws.unofficial.option import OptionChainFetcher, OptionQuote
-from ibtws.unofficial.option.utils import _pick_price
+from ibtws.unofficial.option.utils import _safe_pick_value
 from ibtws.unofficial.order.manager import OrderManager
 from ibtws.unofficial.order.models import OrderSide, OrderState, TimeInForce, TrackedOrder
 
+from .models import CreditSpreadParams, CreditSpreadPlan, SpreadLeg, SpreadType
+from .utils import (
+    CreditSpreadError,
+    _quote_mid,
+    _round_to_tick,
+    select_expiry,
+    select_long_leg,
+    select_short_leg,
+)
+
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
-
-class CreditSpreadError(RuntimeError):
-    """Raised when a credit spread cannot be built or placed.
-
-    The message is always actionable – includes which constraint failed and
-    what numbers were observed – so callers can surface it to a user or log
-    pipeline without further inspection.
-    """
-
-
-# ---------------------------------------------------------------------------
-# Public enums & params
-# ---------------------------------------------------------------------------
-
-
-class SpreadType(str, Enum):
-    """Which side of the underlying the spread leans on.
-
-    * ``BULL_PUT`` – sell a higher-strike put, buy a lower-strike put.
-      Profits when the underlying stays *above* the short put.
-    * ``BEAR_CALL`` – sell a lower-strike call, buy a higher-strike call.
-      Profits when the underlying stays *below* the short call.
-    """
-
-    BULL_PUT = "bull_put"
-    BEAR_CALL = "bear_call"
-
-    @property
-    def right(self) -> str:
-        """Option right ("P" or "C") used to filter the chain."""
-        return "P" if self is SpreadType.BULL_PUT else "C"
-
-    @property
-    def is_bullish(self) -> bool:
-        return self is SpreadType.BULL_PUT
-
-
-@dataclass(frozen=True)
-class CreditSpreadParams:
-    """All tunables for building one credit spread.
-
-    Selection knobs
-    ---------------
-    target_short_delta:
-        Absolute delta target for the short leg (e.g. ``0.30`` for a 30-delta
-        short put). The selector picks the strike whose ``|delta|`` is closest
-        to this value among legs that pass the liquidity filters.
-    wing_width:
-        Distance between the short and long strikes, measured in strike-price
-        dollars. For SPX this is typically 5, 10, 25 …; for equities 1, 2.5
-        or 5. The selector snaps to the nearest available strike at or beyond
-        the requested width (so the actual width may differ slightly).
-    target_dte / dte_tolerance:
-        Pick the expiration whose days-to-expiry is closest to
-        ``target_dte`` and at most ``dte_tolerance`` days away. Set
-        ``dte_tolerance = 0`` to require an exact match.
-
-    Economic constraints
-    --------------------
-    min_credit:
-        Reject the spread if the mid-price net credit (per spread, not per
-        contract) is below this value. ``None`` disables the check.
-    min_credit_width_ratio:
-        Reject the spread if ``net_credit / wing_width < min_credit_width_ratio``.
-        A common floor is ``1/3`` (collect at least one third of the width).
-    max_short_delta:
-        Hard cap on the short-leg ``|delta|`` after selection. Guards against
-        the chain only having far-OTM strikes when the desired delta is not
-        available. ``None`` to disable.
-    min_open_interest / min_volume:
-        Liquidity filters applied to each leg before selection. Legs with
-        missing data are *kept* (IB sometimes omits OI for fresh quotes) –
-        set these to ``0`` if you want the filter inactive.
-
-    Order knobs
-    -----------
-    quantity:
-        Number of spreads to trade (each = 100 shares notional for equity
-        options).
-    limit_slippage:
-        How far below mid the entry limit can sit, as a fraction of the
-        mid. ``0.05`` means "accept 5 % less credit than the mid-quote".
-    take_profit_pct:
-        Close the spread when realised profit reaches this fraction of the
-        original credit captured. ``0.5`` = standard 50 %-of-credit exit.
-    stop_loss_multiplier:
-        Close the spread when realised loss reaches ``credit * multiplier``.
-        ``2.0`` = stop out when losing 2x the credit collected.
-    outside_rth:
-        Forward ``outsideRth=True`` to the underlying IB order so it can fill
-        during pre- and post-market sessions. Has no effect on instruments
-        that don't trade outside RTH (e.g. SPX/SPXW index options on CBOE).
-
-    Universe knobs
-    --------------
-    exchange / currency / trading_class:
-        Forwarded to :class:`OptionChainFetcher` to disambiguate SPX vs SPXW
-        and similar variants. Leave default for typical equities.
-    expirations / expiry_from / expiry_to:
-        Optional pre-filters on the chain to bound IB qualification work.
-        Useful when the symbol has hundreds of expiries (e.g. SPX) and you
-        already know which week you want.
-    strike_window_pct:
-        ±fraction of spot used to bound strike snapshots, forwarded to the
-        fetcher. ``0.10`` covers typical 30Δ–50Δ regions on most names.
-    """
-
-    underlying: Contract
-    spread_type: SpreadType
-
-    # Selection
-    target_short_delta: float = 0.30
-    wing_width: float = 5.0
-    target_dte: int = 30
-    dte_tolerance: int = 14
-    max_short_delta: Optional[float] = 0.50
-    min_open_interest: float = 0.0
-    min_volume: float = 0.0
-
-    # Economic constraints
-    min_credit: Optional[float] = None
-    min_credit_width_ratio: Optional[float] = None
-
-    # Order knobs
-    quantity: int = 1
-    limit_slippage: float = 0.05
-    tif: TimeInForce = TimeInForce.DAY
-    account: Optional[str] = None
-    outside_rth: bool = False  # set True to allow fills in pre-/post-market sessions
-
-    # Exit knobs
-    take_profit_pct: Optional[float] = 0.5
-    stop_loss_multiplier: Optional[float] = 2.0
-
-    # Universe knobs
-    exchange: str = "SMART"
-    currency: str = "USD"
-    trading_class: Optional[str] = None
-    expirations: Optional[Sequence[str]] = None
-    expiry_from: Optional[str] = None
-    expiry_to: Optional[str] = None
-    strike_window_pct: float = 0.10
-
-    def __post_init__(self) -> None:
-        if not (0.0 < self.target_short_delta < 1.0):
-            raise ValueError(f"target_short_delta must be in (0, 1), got {self.target_short_delta!r}")
-        if self.wing_width <= 0:
-            raise ValueError(f"wing_width must be positive, got {self.wing_width!r}")
-        if self.target_dte < 0:
-            raise ValueError(f"target_dte must be >= 0, got {self.target_dte!r}")
-        if self.dte_tolerance < 0:
-            raise ValueError(f"dte_tolerance must be >= 0, got {self.dte_tolerance!r}")
-        if self.quantity <= 0:
-            raise ValueError(f"quantity must be positive, got {self.quantity!r}")
-        if not (0.0 <= self.limit_slippage < 1.0):
-            raise ValueError(f"limit_slippage must be in [0, 1), got {self.limit_slippage!r}")
-        if self.take_profit_pct is not None and not (0.0 < self.take_profit_pct <= 1.0):
-            raise ValueError(f"take_profit_pct must be in (0, 1], got {self.take_profit_pct!r}")
-        if self.stop_loss_multiplier is not None and self.stop_loss_multiplier <= 0:
-            raise ValueError(f"stop_loss_multiplier must be positive, got {self.stop_loss_multiplier!r}")
-
-
-# ---------------------------------------------------------------------------
-# Plan dataclasses
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class SpreadLeg:
-    """One side of a vertical spread, with the quote that drove its selection."""
-
-    quote: OptionQuote
-    action: OrderSide  # SELL for short leg, BUY for long leg
-
-    @property
-    def conId(self) -> int:
-        return int(self.quote.contract.conId)
-
-    @property
-    def strike(self) -> float:
-        return float(self.quote.contract.strike)
-
-
-@dataclass(frozen=True)
-class CreditSpreadPlan:
-    """Fully-resolved spread, ready to be placed.
-
-    All cash figures are *per spread* in account currency (not per share, not
-    per ratio). Multiply by ``quantity`` for portfolio totals.
-    """
-
-    spread_type: SpreadType
-    underlying_symbol: str
-    expiry: str
-    short_leg: SpreadLeg
-    long_leg: SpreadLeg
-    width: float
-    multiplier: float
-    net_credit: float
-    max_profit: float
-    max_loss: float
-    breakeven: float
-    short_delta: float
-    bag: Bag
-    take_profit_debit: Optional[float]
-    stop_loss_debit: Optional[float]
-    params: CreditSpreadParams
-    spot_price: Optional[float] = None
-    created_at: float = field(default_factory=time.time)
-
-    @property
-    def risk_reward(self) -> float:
-        """Max-profit / max-loss. Higher is better. Returns inf if max_loss == 0."""
-        return self.max_profit / self.max_loss if self.max_loss > 0 else math.inf
-
-    def describe(self) -> str:
-        """One-line human-readable summary suitable for logs / CLI output."""
-        return (
-            f"{self.spread_type.value} {self.underlying_symbol} {self.expiry} "
-            f"{self.short_leg.strike:g}/{self.long_leg.strike:g} "
-            f"width={self.width:g} credit={self.net_credit:.2f} "
-            f"max_loss={self.max_loss:.2f} Δshort={self.short_delta:.3f}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Selection helpers (pure functions, easily unit-testable)
-# ---------------------------------------------------------------------------
-
-
-def _parse_expiry_to_dte(expiry: str, *, now: Optional[float] = None) -> int:
-    """Convert a ``YYYYMMDD`` expiration string into days-to-expiry.
-
-    IBKR also returns ``YYYYMM`` for monthlies – treated as the third-Friday
-    convention (just use day 15 as a reasonable proxy). Negative DTEs (already
-    expired) are returned as-is so the caller can filter them out.
-    """
-    if len(expiry) == 6:
-        expiry = expiry + "15"
-    if len(expiry) != 8 or not expiry.isdigit():
-        raise ValueError(f"Unrecognised expiry format: {expiry!r}")
-
-    import datetime as _dt
-
-    y, m, d = int(expiry[:4]), int(expiry[4:6]), int(expiry[6:])
-    target = _dt.datetime(y, m, d, 16, 0, 0, tzinfo=_dt.timezone.utc)  # 4pm ET close as proxy
-    ref = (
-        _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc) if now is not None else _dt.datetime.now(_dt.timezone.utc)
-    )
-    return (target - ref).days
-
-
-def select_expiry(
-    expirations: Iterable[str],
-    *,
-    target_dte: int,
-    dte_tolerance: int,
-    now: Optional[float] = None,
-) -> str:
-    """Pick the expiry closest to ``target_dte`` within ``dte_tolerance``.
-
-    Negative-DTE (expired) entries are ignored. Raises
-    :class:`CreditSpreadError` if no expiry survives the tolerance window.
-    """
-    candidates: list[tuple[int, str]] = []
-    for exp in expirations:
-        try:
-            dte = _parse_expiry_to_dte(exp, now=now)
-        except ValueError:
-            continue
-        if dte < 0:
-            continue
-        if abs(dte - target_dte) <= dte_tolerance:
-            candidates.append((abs(dte - target_dte), exp))
-    if not candidates:
-        raise CreditSpreadError(
-            f"No expiry within {dte_tolerance}d of target_dte={target_dte} in {list(expirations)!r}"
-        )
-    candidates.sort()
-    chosen = candidates[0][1]
-    logger.info(f"CreditSpread: chose expiry {chosen} (Δdte={candidates[0][0]}d) from {len(candidates)} candidate(s)")
-    return chosen
-
-
-def _quote_is_tradeable(
-    quote: OptionQuote,
-    *,
-    min_open_interest: float,
-    min_volume: float,
-) -> bool:
-    """Liquidity / data-quality filter applied before strike selection.
-
-    A leg is rejected only when IB explicitly returned a too-low value. Legs
-    whose OI or volume is ``None`` (IB simply did not include it in the
-    snapshot) are *kept* — they would otherwise be discarded en masse for
-    freshly-listed expiries.
-    """
-    if quote.delta is None:
-        return False
-    if quote.contract.conId == 0:
-        return False
-    if quote.open_interest is not None and quote.open_interest < min_open_interest:
-        return False
-    if quote.volume is not None and quote.volume < min_volume:
-        return False
-    return True
-
-
-def select_short_leg(
-    quotes: Sequence[OptionQuote],
-    *,
-    target_short_delta: float,
-    max_short_delta: Optional[float],
-    min_open_interest: float,
-    min_volume: float,
-) -> OptionQuote:
-    """Pick the option whose ``|delta|`` is closest to the target.
-
-    Filters out quotes that fail the liquidity / data-quality check first.
-    Enforces ``max_short_delta`` as a hard ceiling — if no remaining quote
-    fits, the spread is rejected (rather than silently widening risk).
-    """
-    candidates = [
-        q for q in quotes if _quote_is_tradeable(q, min_open_interest=min_open_interest, min_volume=min_volume)
-    ]
-    if not candidates:
-        raise CreditSpreadError(f"No tradeable quotes (need delta + conId; got {len(quotes)} raw)")
-    if max_short_delta is not None:
-        candidates = [q for q in candidates if q.delta is not None and abs(q.delta) <= max_short_delta]
-        if not candidates:
-            raise CreditSpreadError(f"All candidate strikes exceed max_short_delta={max_short_delta}")
-    candidates.sort(key=lambda q: abs(abs(q.delta or 0.0) - target_short_delta))
-    return candidates[0]
-
-
-def select_long_leg(
-    quotes: Sequence[OptionQuote],
-    *,
-    short: OptionQuote,
-    wing_width: float,
-    spread_type: SpreadType,
-    min_open_interest: float,
-    min_volume: float,
-) -> OptionQuote:
-    """Pick the protective leg at (or just beyond) the requested wing width.
-
-    For a bull-put spread the long is *lower* than the short; for a bear-call
-    spread the long is *higher*. We snap to the strike whose distance from
-    the short is at least ``wing_width`` and minimised. Falls back to the
-    farthest available strike when none meets the minimum width (e.g.
-    chain truncated by ``strike_window_pct``).
-    """
-    short_strike = float(short.contract.strike)
-    target = short_strike - wing_width if spread_type is SpreadType.BULL_PUT else short_strike + wing_width
-
-    tradeable = [
-        q
-        for q in quotes
-        if _quote_is_tradeable(q, min_open_interest=min_open_interest, min_volume=min_volume)
-        and q.contract.conId != short.contract.conId
-        and q.contract.right == short.contract.right
-        and q.contract.lastTradeDateOrContractMonth == short.contract.lastTradeDateOrContractMonth
-    ]
-    if spread_type is SpreadType.BULL_PUT:
-        tradeable = [q for q in tradeable if q.contract.strike < short_strike]
-    else:
-        tradeable = [q for q in tradeable if q.contract.strike > short_strike]
-    if not tradeable:
-        raise CreditSpreadError(
-            f"No protective leg available on the {('lower' if spread_type is SpreadType.BULL_PUT else 'higher')} "
-            f"side of strike {short_strike}"
-        )
-
-    tradeable.sort(key=lambda q: abs(q.contract.strike - target))
-    chosen = tradeable[0]
-    actual_width = abs(chosen.contract.strike - short_strike)
-    if actual_width < wing_width * 0.5:
-        # Final guard — refusing to trade a 1-strike-wide spread when user
-        # asked for 10 wide. Better to fail loud than fill a tiny credit.
-        raise CreditSpreadError(
-            f"Closest protective strike only {actual_width:g} wide (requested {wing_width:g}) — chain too narrow"
-        )
-    return chosen
-
-
-def _quote_mid(q: OptionQuote) -> Optional[float]:
-    """Bid/ask midpoint with NaN-safe handling. ``None`` when either side is missing."""
-    if q.bid is None or q.ask is None:
-        return None
-    if q.bid <= 0 or q.ask <= 0 or q.ask < q.bid:
-        return None
-    return (q.bid + q.ask) / 2.0
-
-
-def _round_to_tick(price: float, tick: float = 0.05) -> float:
-    """Round to the nearest IB-acceptable tick (default 5¢ for options)."""
-    if tick <= 0:
-        return price
-    return round(price / tick) * tick
-
-
-# ---------------------------------------------------------------------------
-# Strategy class
-# ---------------------------------------------------------------------------
 
 
 class CreditSpreadStrategy:
@@ -524,7 +121,7 @@ class CreditSpreadStrategy:
         """
         underlying = params.underlying
         if not getattr(underlying, "conId", 0):
-            (underlying,) = await self._client.qualify(underlying)
+            (underlying,) = await self._client.ib.qualifyContractsAsync(underlying)
 
         chain = await self._fetcher.fetch_chain_definition(
             underlying, exchange=params.exchange, trading_class=params.trading_class
@@ -647,10 +244,12 @@ class CreditSpreadStrategy:
         limit_debit: Optional[float] = None,
         tif: Optional[TimeInForce] = None,
     ) -> TrackedOrder:
-        """Close the spread with a BUY-back BAG limit order via :class:`OrderManager`.
+        """Close the spread by selling the BAG (reversing leg actions) at a debit.
 
-        ``limit_debit`` defaults to the plan's stored take-profit debit if
-        present, else to the current mid-debit plus slippage.
+        IB combo convention: SELL the same BAG reverses the leg directions
+        (BUY back the short, SELL the long). The limit price on a SELL order
+        is the minimum net credit you'll accept — negative means you're
+        willing to pay a debit. So closing at $0.20 debit → SELL @ -0.20.
         """
         if limit_debit is None:
             limit_debit = plan.take_profit_debit
@@ -664,26 +263,21 @@ class CreditSpreadStrategy:
         if limit_debit <= 0:
             raise CreditSpreadError(f"Close limit debit {limit_debit:.2f} <= 0")
 
+        # SELL BAG @ negative = pay debit to close (IB reverses leg actions).
+        signed_limit = -limit_debit
         logger.info(
-            f"CreditSpread: closing combo BUY x{plan.params.quantity} @ debit {limit_debit:.2f} ({plan.describe()})"
+            f"CreditSpread: closing combo SELL x{plan.params.quantity} @ net {signed_limit:.2f} "
+            f"(debit {limit_debit:.2f}, {plan.describe()})"
         )
-        try:
-            return await self._om.limit(
-                plan.bag,
-                OrderSide.BUY,
-                plan.params.quantity,
-                limit_debit,
-                tif=tif or plan.params.tif,
-                account=plan.params.account,
-                outside_rth=plan.params.outside_rth,
-            )
-        finally:
-            # Free the market-data lines opened while monitoring this spread.
-            # IB caps simultaneous subscriptions (~100/session) and long-running
-            # strategies that build many spreads accumulate them otherwise.
-            released = self._fetcher.release([plan.short_leg.quote.contract, plan.long_leg.quote.contract])
-            if released:
-                logger.debug(f"CreditSpread: released {released} mkt-data subscription(s) on close")
+        return await self._om.limit(
+            plan.bag,
+            OrderSide.SELL,
+            plan.params.quantity,
+            signed_limit,
+            tif=tif or plan.params.tif,
+            account=plan.params.account,
+            outside_rth=plan.params.outside_rth,
+        )
 
     # ------------------------------------------------------------------
     # Stage 4b: monitor + exit
@@ -878,11 +472,17 @@ class CreditSpreadStrategy:
         if len(tickers) != 2:
             return None
         short_t, long_t = tickers
-        short_ask = _pick_price(short_t, "ask")
-        short_bid = _pick_price(short_t, "bid")
-        long_ask = _pick_price(long_t, "ask")
-        long_bid = _pick_price(long_t, "bid")
+        short_ask = _safe_pick_value(short_t, "ask")
+        short_bid = _safe_pick_value(short_t, "bid")
+        long_ask = _safe_pick_value(long_t, "ask")
+        long_bid = _safe_pick_value(long_t, "bid")
         if short_ask is None or short_bid is None or long_ask is None or long_bid is None:
+            return None
+        # Reject non-positive or crossed quotes — IB sometimes streams a 0
+        # bid before the book is loaded, which would silently bias the mid.
+        if short_bid <= 0 or short_ask <= 0 or long_bid <= 0 or long_ask <= 0:
+            return None
+        if short_ask < short_bid or long_ask < long_bid:
             return None
         # Closing debit = buy back short at ask − sell long at bid (worst case),
         # but we use mids for "fair" decisions: short_mid − long_mid.

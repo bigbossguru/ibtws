@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import time
 from typing import Iterable, Optional, Sequence
 
 import pandas as pd
@@ -44,74 +43,26 @@ def _filter_strikes(
     return [s for s in available if (strike_from is None or s >= strike_from) and (strike_to is None or s <= strike_to)]
 
 
-def _safe_float(value) -> Optional[float]:
-    """Normalise IB's NaN / None / non-numeric "no data" values into ``Optional[float]``."""
+def _safe_pick_value(obj: object, attr: str, *, allow_negative: bool = False) -> Optional[float]:
+    """Return the price or any value at ``attr``, scrubbing IB's ``-1`` / NaN sentinels.
+
+    IB uses ``-1.0`` (and sometimes other negative values) to signal "no data"
+    on price fields (bid, ask, last, close, volume, OI). By default these are
+    filtered out. Pass ``allow_negative=True`` for fields that are legitimately
+    negative (e.g. delta, theta).
+    """
+    value = getattr(obj, attr, None)
     if value is None:
         return None
     try:
         f = float(value)
     except (TypeError, ValueError):
         return None
-    return None if math.isnan(f) else f
-
-
-def _safe_price(value) -> Optional[float]:
-    """Like :func:`_safe_float` but also treats IB's ``-1.0`` sentinel as missing."""
-    f = _safe_float(value)
-    if f is None or f <= 0:
+    if math.isnan(f):
+        return None
+    if not allow_negative and f < 0:
         return None
     return f
-
-
-def _pick_price(ticker: Ticker, attr: str) -> Optional[float]:
-    """Return the price at ``attr``, scrubbing IB's ``-1`` / NaN sentinels."""
-    return _safe_price(getattr(ticker, attr, None))
-
-
-def _ticker_age_s(ticker: Ticker, *, now: Optional[float] = None) -> Optional[float]:
-    """Best-effort age of a Ticker snapshot in seconds.
-
-    IB tickers carry a ``time`` attribute (datetime in UTC). When present we
-    return ``now - ticker.time`` in seconds. When absent (some snapshot paths
-    omit it) we fall back to the most recent of ``bidTime`` / ``askTime`` /
-    ``lastTime`` if any are populated. Returns ``None`` when no timestamp
-    is available — callers should treat that as "age unknown", not "fresh".
-    """
-    ref = now if now is not None else time.time()
-
-    def _ts(value) -> Optional[float]:
-        if value is None:
-            return None
-        # ib_async ticker timestamps are datetime; older paths give floats.
-        try:
-            return float(value.timestamp()) if hasattr(value, "timestamp") else float(value)
-        except (TypeError, ValueError):
-            return None
-
-    candidates = []
-    for attr in ("time", "lastTime", "bidTime", "askTime"):
-        ts = _ts(getattr(ticker, attr, None))
-        if ts is not None:
-            candidates.append(ts)
-    if not candidates:
-        return None
-    age = ref - max(candidates)
-    return age if age >= 0 else 0.0
-
-
-def is_quote_fresh(ticker: Ticker, max_age_s: float, *, now: Optional[float] = None) -> bool:
-    """Return True when the ticker's timestamp is within ``max_age_s`` of *now*.
-
-    A missing timestamp is treated as *not fresh* — better to drop and retry
-    than to act on a quote whose age we cannot verify. ``max_age_s <= 0``
-    disables the check (always fresh).
-    """
-    if max_age_s <= 0:
-        return True
-    age = _ticker_age_s(ticker, now=now)
-    if age is None:
-        return False
-    return age <= max_age_s
 
 
 def _ticker_to_quote(ticker: Ticker, underlying_price: Optional[float] = None) -> OptionQuote:
@@ -119,19 +70,17 @@ def _ticker_to_quote(ticker: Ticker, underlying_price: Optional[float] = None) -
     greeks = getattr(ticker, "modelGreeks", None)
     return OptionQuote(
         contract=ticker.contract,
-        bid=_pick_price(ticker, "bid"),
-        ask=_pick_price(ticker, "ask"),
-        volume=_safe_price(getattr(ticker, "volume", None)),
-        open_interest=_safe_float(
-            getattr(ticker, "callOpenInterest", None)
-            if ticker.contract.right == "C"
-            else getattr(ticker, "putOpenInterest", None)
+        bid=_safe_pick_value(ticker, "bid"),
+        ask=_safe_pick_value(ticker, "ask"),
+        volume=_safe_pick_value(ticker, "volume"),
+        open_interest=_safe_pick_value(
+            ticker, "callOpenInterest" if ticker.contract.right == "C" else "putOpenInterest"
         ),
-        iv=_safe_float(getattr(greeks, "impliedVol", None)) if greeks else None,
-        delta=_safe_float(getattr(greeks, "delta", None)) if greeks else None,
-        gamma=_safe_float(getattr(greeks, "gamma", None)) if greeks else None,
-        vega=_safe_float(getattr(greeks, "vega", None)) if greeks else None,
-        theta=_safe_float(getattr(greeks, "theta", None)) if greeks else None,
+        iv=_safe_pick_value(greeks, "impliedVol") if greeks else None,
+        delta=_safe_pick_value(greeks, "delta", allow_negative=True) if greeks else None,
+        gamma=_safe_pick_value(greeks, "gamma") if greeks else None,
+        vega=_safe_pick_value(greeks, "vega") if greeks else None,
+        theta=_safe_pick_value(greeks, "theta", allow_negative=True) if greeks else None,
         underlying_price=underlying_price,
     )
 

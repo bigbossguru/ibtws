@@ -27,39 +27,29 @@ from ibtws.unofficial.option import OptionChainFetcher
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 
 
-def on_connected(client: IBKRClient) -> None:
-    print(f"[hook] connected. Server v{client.ib.client.serverVersion()}")
-
-
-def on_disconnected(client: IBKRClient) -> None:
-    print("[hook] disconnected — reconnect loop will spin up automatically.")
-
-
-def on_error(req_id: int, code: int, msg: str, advanced: str) -> None:
-    if code >= 1000:  # filter out genuine errors only
-        print(f"[hook] err code={code} reqId={req_id} msg={msg}")
-
-
 async def main() -> None:
     config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)  # TWS paper
 
     async with IBKRClient(config) as client:
-        await client.connect()
-
         # 1 = live, 2 = frozen, 3 = delayed, 4 = delayed-frozen
-        client.ib.reqMarketDataType(2)
+        client.ib.reqMarketDataType(4)
 
         underlying = Index("SPX", "CBOE", "USD")
-        [underlying] = await client.qualify(underlying)
-
-        fetcher = OptionChainFetcher(client)
-
-        # SPX has hundreds of listed strikes — auto-window to ±5% of spot to
-        # keep the request bounded.
-        logging.info(f"Fetching SPX chain snapshot (frozen data) for {underlying}...")
-        df = await fetcher.fetch_snapshot(
+        # underlying = ContFuture("ES", "CME", "USD")
+        await client.get_market_data(underlying)
+        historical_data = await client.get_historical_data(
             underlying,
-            expirations=["20260520"],
+            duration="1 D",
+            bar_size="5 mins",
+            use_rth=False,
+        )
+        logging.info(historical_data)
+
+        optchain = OptionChainFetcher(client)
+        logging.info(f"Fetching SPX chain snapshot (frozen data) for {underlying}...")
+        df = await optchain.fetch_snapshot(
+            underlying,
+            expirations=["20260526"],
             trading_class="SPXW",
             strike_window_pct=0.02,
             as_dataframe=True,
