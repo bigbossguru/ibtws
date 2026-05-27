@@ -50,7 +50,7 @@ from ib_async import Bag, ComboLeg
 
 from ibtws.unofficial.client import IBKRClient
 from ibtws.unofficial.option import OptionChainFetcher, OptionQuote
-from ibtws.unofficial.option.utils import _safe_pick_value
+from ibtws.unofficial.helpers import safe_pick_value
 from ibtws.unofficial.order.manager import OrderManager
 from ibtws.unofficial.order.models import OrderSide, OrderState, TimeInForce, TrackedOrder
 
@@ -472,10 +472,10 @@ class CreditSpreadStrategy:
         if len(tickers) != 2:
             return None
         short_t, long_t = tickers
-        short_ask = _safe_pick_value(short_t, "ask")
-        short_bid = _safe_pick_value(short_t, "bid")
-        long_ask = _safe_pick_value(long_t, "ask")
-        long_bid = _safe_pick_value(long_t, "bid")
+        short_ask = safe_pick_value(short_t, "ask")
+        short_bid = safe_pick_value(short_t, "bid")
+        long_ask = safe_pick_value(long_t, "ask")
+        long_bid = safe_pick_value(long_t, "bid")
         if short_ask is None or short_bid is None or long_ask is None or long_bid is None:
             return None
         # Reject non-positive or crossed quotes — IB sometimes streams a 0

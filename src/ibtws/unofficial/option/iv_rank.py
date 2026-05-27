@@ -25,7 +25,8 @@ import logging
 from ib_async import Contract
 
 from ibtws.unofficial.client import IBKRClient
-from .utils import _safe_pick_value
+from ibtws.unofficial.helpers import safe_pick_value
+
 from .models import IVRankResult
 
 
@@ -95,7 +96,7 @@ class IVRankCalculator:
         ivs: list[float] = []
         dates: list[_dt.date] = []
         for bar in bars or []:
-            v = _safe_pick_value(bar, "close")
+            v = safe_pick_value(bar, "close")
             if v is None or v <= 0:
                 continue
             ivs.append(v)
