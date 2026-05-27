@@ -5,11 +5,10 @@ from __future__ import annotations
 import pytest
 from ib_async import Option
 
+from ibtws.unofficial.helpers import chunked, safe_pick_value
 from ibtws.unofficial.option.utils import (
-    _chunked,
     _filter_expirations,
     _filter_strikes,
-    _safe_pick_value,
     _ticker_to_quote,
 )
 
@@ -17,11 +16,11 @@ from .conftest import make_ticker
 
 
 def test_chunked_splits_evenly_and_preserves_order():
-    assert list(_chunked([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]]
+    assert list(chunked([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]]
 
 
 def test_chunked_empty_returns_nothing():
-    assert list(_chunked([], 10)) == []
+    assert list(chunked([], 10)) == []
 
 
 @pytest.mark.parametrize(
@@ -36,12 +35,12 @@ def test_chunked_empty_returns_nothing():
 )
 def test_pick_price(attr_value, expected):
     obj = type("X", (), {"v": attr_value})()
-    assert _safe_pick_value(obj, "v") == expected
+    assert safe_pick_value(obj, "v") == expected
 
 
 def test_pick_price_missing_attr_returns_none():
     obj = type("X", (), {})()
-    assert _safe_pick_value(obj, "missing") is None
+    assert safe_pick_value(obj, "missing") is None
 
 
 def test_filter_expirations_explicit_wins_over_range():

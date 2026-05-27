@@ -2,19 +2,14 @@
 
 from __future__ import annotations
 
-import math
 from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 from ib_async import Ticker
 
+from ibtws.unofficial.helpers import safe_pick_value
+
 from .models import OptionQuote
-
-
-def _chunked(seq: Sequence, size: int):
-    """Yield successive ``size``-length slices of *seq* (preserves element type)."""
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
 
 
 def _filter_expirations(
@@ -43,44 +38,22 @@ def _filter_strikes(
     return [s for s in available if (strike_from is None or s >= strike_from) and (strike_to is None or s <= strike_to)]
 
 
-def _safe_pick_value(obj: object, attr: str, *, allow_negative: bool = False) -> Optional[float]:
-    """Return the price or any value at ``attr``, scrubbing IB's ``-1`` / NaN sentinels.
-
-    IB uses ``-1.0`` (and sometimes other negative values) to signal "no data"
-    on price fields (bid, ask, last, close, volume, OI). By default these are
-    filtered out. Pass ``allow_negative=True`` for fields that are legitimately
-    negative (e.g. delta, theta).
-    """
-    value = getattr(obj, attr, None)
-    if value is None:
-        return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(f):
-        return None
-    if not allow_negative and f < 0:
-        return None
-    return f
-
-
 def _ticker_to_quote(ticker: Ticker, underlying_price: Optional[float] = None) -> OptionQuote:
     """Map an ib_async ``Ticker`` snapshot into an :class:`OptionQuote`."""
     greeks = getattr(ticker, "modelGreeks", None)
     return OptionQuote(
         contract=ticker.contract,
-        bid=_safe_pick_value(ticker, "bid"),
-        ask=_safe_pick_value(ticker, "ask"),
-        volume=_safe_pick_value(ticker, "volume"),
-        open_interest=_safe_pick_value(
+        bid=safe_pick_value(ticker, "bid"),
+        ask=safe_pick_value(ticker, "ask"),
+        volume=safe_pick_value(ticker, "volume"),
+        open_interest=safe_pick_value(
             ticker, "callOpenInterest" if ticker.contract.right == "C" else "putOpenInterest"
         ),
-        iv=_safe_pick_value(greeks, "impliedVol") if greeks else None,
-        delta=_safe_pick_value(greeks, "delta", allow_negative=True) if greeks else None,
-        gamma=_safe_pick_value(greeks, "gamma") if greeks else None,
-        vega=_safe_pick_value(greeks, "vega") if greeks else None,
-        theta=_safe_pick_value(greeks, "theta", allow_negative=True) if greeks else None,
+        iv=safe_pick_value(greeks, "impliedVol") if greeks else None,
+        delta=safe_pick_value(greeks, "delta", allow_negative=True) if greeks else None,
+        gamma=safe_pick_value(greeks, "gamma") if greeks else None,
+        vega=safe_pick_value(greeks, "vega") if greeks else None,
+        theta=safe_pick_value(greeks, "theta", allow_negative=True) if greeks else None,
         underlying_price=underlying_price,
     )
 

@@ -9,13 +9,12 @@ from ib_async import Contract, Option, Ticker
 
 from ibtws.unofficial._pacing import ThrottledExecutor
 from ibtws.unofficial.client import IBKRClient
+from ibtws.unofficial.helpers import chunked, fetch_spot
 
 from .models import ChainDefinition, OptionQuote
 from .utils import (
-    _chunked,
     _filter_expirations,
     _filter_strikes,
-    _safe_pick_value,
     _ticker_to_quote,
     quotes_to_dataframe,
 )
@@ -120,7 +119,7 @@ class OptionChainFetcher:
 
         quotes: list[OptionQuote] = []
 
-        for batch in _chunked(contracts, batch_size):
+        for batch in chunked(contracts, batch_size):
             tickers = await self._snapshot_batch(batch)
             for t in tickers:
                 quotes.append(_ticker_to_quote(t, spot_price))
@@ -153,7 +152,7 @@ class OptionChainFetcher:
         spot: float | None = None
         no_explicit_strikes = strikes is None and strike_from is None and strike_to is None
         if selected_exp and no_explicit_strikes and strike_window_pct is not None and strike_window_pct > 0:
-            spot = await self._fetch_spot(underlying)
+            spot = await fetch_spot(underlying, self._client)
             if spot is not None and spot > 0:
                 lo = spot * (1.0 - strike_window_pct)
                 hi = spot * (1.0 + strike_window_pct)
@@ -200,19 +199,6 @@ class OptionChainFetcher:
         if dropped:
             logger.warning(f"OptionChainFetcher: dropped {dropped} unresolved contract(s) after qualify")
         return resolved, spot
-
-    async def _fetch_spot(self, underlying: Contract) -> float | None:
-        t = await self._client.get_market_data(underlying)
-        for attr in ("last", "close"):
-            v = _safe_pick_value(t, attr)
-            if v is not None:
-                return v
-        bid = _safe_pick_value(t, "bid")
-        ask = _safe_pick_value(t, "ask")
-        if bid is not None and ask is not None:
-            return (bid + ask) / 2.0
-        logger.warning(f"OptionChainFetcher: spot for {underlying.symbol} unavailable — skipping auto-window")
-        return None
 
     async def _snapshot_batch(self, contracts: list[Option]) -> list[Ticker]:
         for c in contracts:
