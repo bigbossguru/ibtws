@@ -29,7 +29,7 @@ def _print(r: VolRegimeResult) -> None:
     print(f"  VIX1D        : {r.vix1d:.2f}  [prev close]")
     print(f"  VIX9D        : {r.vix9d:.2f}  [prev close]")
     print(f"  VX front     : {r.vx_front:.2f}  [LIVE]")
-    print(f"  VIX 52w H/L  : {r.vix_52w_high:.2f} / {r.vix_52w_low:.2f}")
+    print(f"  IV Rank      : {r.ivr:.1f}")
     print(f"  RV 20d       : {r.rv_20d:.2f}%")
     print()
     print("Components:")
@@ -55,7 +55,7 @@ async def main() -> None:
 
         detector = VolRegimeDetector(client)
         result = await detector.detect()
-        print(result)
+        _print(result)
 
 
 if __name__ == "__main__":
