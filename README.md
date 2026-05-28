@@ -1,4 +1,5 @@
 # IB TWS
+[![CI](https://github.com/bigbossguru/ibtws/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bigbossguru/ibtws/actions/workflows/ci.yml) [![Release](https://github.com/bigbossguru/ibtws/actions/workflows/release.yml/badge.svg)](https://github.com/bigbossguru/ibtws/actions/workflows/release.yml) [![Update CHANGELOG](https://github.com/bigbossguru/ibtws/actions/workflows/changelog.yml/badge.svg?branch=main)](https://github.com/bigbossguru/ibtws/actions/workflows/changelog.yml)
 
 ## Contributing
 
