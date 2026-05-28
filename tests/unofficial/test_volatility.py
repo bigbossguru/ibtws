@@ -17,8 +17,7 @@ class TestPremarketVolRegime:
             vix=16.20,
             vx_front=17.80,
             vix_prev_close=15.40,
-            vix_52w_high=23.50,
-            vix_52w_low=12.10,
+            ivr=36.0,
             rv_20d=10.80,
             is_pre_market=True,
         )
@@ -41,8 +40,7 @@ class TestPremarketVolRegime:
             vix=13.0,
             vx_front=16.0,
             vix_prev_close=13.5,
-            vix_52w_high=25.0,
-            vix_52w_low=11.0,
+            ivr=15.0,
             rv_20d=8.0,
         )
         assert result.regime == "GREEN"
@@ -57,8 +55,7 @@ class TestPremarketVolRegime:
             vix=27.0,
             vx_front=25.0,
             vix_prev_close=20.0,
-            vix_52w_high=30.0,
-            vix_52w_low=12.0,
+            ivr=90.0,
             rv_20d=30.0,
         )
         assert result.regime == "RED"
@@ -73,8 +70,7 @@ class TestPremarketVolRegime:
             vix=0.0,
             vx_front=0.0,
             vix_prev_close=0.0,
-            vix_52w_high=0.0,
-            vix_52w_low=0.0,
+            ivr=0.0,
             rv_20d=0.0,
         )
         assert isinstance(result, VolRegimeResult)
@@ -87,8 +83,7 @@ class TestPremarketVolRegime:
             vix=14.0,
             vx_front=15.0,
             vix_prev_close=13.5,
-            vix_52w_high=25.0,
-            vix_52w_low=11.0,
+            ivr=40.0,
             rv_20d=10.0,
             is_pre_market=True,
         )
@@ -101,8 +96,7 @@ class TestPremarketVolRegime:
             vix=14.0,
             vx_front=15.0,
             vix_prev_close=13.5,
-            vix_52w_high=25.0,
-            vix_52w_low=11.0,
+            ivr=40.0,
             rv_20d=10.0,
             is_pre_market=False,
         )

@@ -59,8 +59,7 @@ class VolRegimeResult:
     vix9d: float = 0.0
     vx_front: float = 0.0
     vix_prev_close: float = 0.0
-    vix_52w_high: float = 0.0
-    vix_52w_low: float = 0.0
+    ivr: float = 0.0
     rv_20d: float = 0.0
     is_pre_market: bool = True
 
@@ -75,8 +74,7 @@ def premarket_vol_regime(
     vix: float,
     vx_front: float,
     vix_prev_close: float,
-    vix_52w_high: float,
-    vix_52w_low: float,
+    ivr: float,
     rv_20d: float,
     is_pre_market: bool = True,
 ) -> VolRegimeResult:
@@ -94,10 +92,8 @@ def premarket_vol_regime(
         Front-month VX futures price (live).
     vix_prev_close:
         Yesterday's VIX closing value.
-    vix_52w_high:
-        VIX 52-week high.
-    vix_52w_low:
-        VIX 52-week low.
+    ivr:
+        IV Rank (0–100) from IVRankCalculator.
     rv_20d:
         20-day realized volatility of SPX (annualized %).
     is_pre_market:
@@ -166,8 +162,6 @@ def premarket_vol_regime(
         c5 = 10
 
     # C6: IV Rank (0–5)
-    vix_range = vix_52w_high - vix_52w_low
-    ivr = ((vix - vix_52w_low) / vix_range * 100) if vix_range > 0 else 50.0
     if ivr < 30:
         c6 = 0
     elif ivr < 50:
@@ -224,8 +218,7 @@ def premarket_vol_regime(
         vix9d=vix9d,
         vx_front=vx_front,
         vix_prev_close=vix_prev_close,
-        vix_52w_high=vix_52w_high,
-        vix_52w_low=vix_52w_low,
+        ivr=ivr,
         rv_20d=rv_20d,
         is_pre_market=is_pre_market,
     )
@@ -251,7 +244,7 @@ class VolRegimeDetector:
         vx_front = await self._get_vx_front()
         vix1d = await self._get_prev_close_or_last_price(Index("VIX1D", "CBOE"))
         vix9d = await self._get_prev_close_or_last_price(Index("VIX9D", "CBOE"))
-        vix_52w_high, vix_52w_low = await self._get_iv_rank()
+        ivr = await self._get_iv_rank()
         rv_20d = await self._get_rv_20d()
 
         return premarket_vol_regime(
@@ -260,8 +253,7 @@ class VolRegimeDetector:
             vix=vix_live,
             vx_front=vx_front,
             vix_prev_close=vix_prev_close,
-            vix_52w_high=vix_52w_high,
-            vix_52w_low=vix_52w_low,
+            ivr=ivr,
             rv_20d=rv_20d,
             is_pre_market=is_pre_market,
         )
@@ -334,16 +326,15 @@ class VolRegimeDetector:
         price = ticker.last if not math.isnan(ticker.last) else ticker.close
         return float(price)
 
-    async def _get_iv_rank(self) -> tuple[float, float]:
-        """Return (52w IV high, 52w IV low) for SPX using IVRankCalculator."""
+    async def _get_iv_rank(self) -> float:
+        """Return IV Rank (0–100) for SPX using IVRankCalculator."""
         calculator = IVRankCalculator(self._client)
         contract = Index("SPX", "CBOE", "USD")
-        result = await calculator.calculate(contract)
-        if result.max_iv is not None and result.min_iv is not None:
-            # Convert from decimal (e.g. 0.18) to percentage (18.0) to match VIX scale
-            return result.max_iv * 100, result.min_iv * 100
-        logger.warning("VolRegime: IVRankCalculator returned no data, using defaults")
-        return 30.0, 12.0
+        result = await calculator.calculate(contract, lookback_days=252)
+        if result.iv_rank is not None:
+            return result.iv_rank
+        logger.warning("VolRegime: IVRankCalculator returned no data, using 50")
+        return 50.0
 
     async def _get_rv_20d(self) -> float:
         """Return 20-day annualized realized volatility of SPX (as %)."""
