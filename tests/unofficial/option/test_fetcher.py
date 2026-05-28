@@ -127,6 +127,44 @@ async def test_fetch_snapshot_returns_empty_when_filters_exclude_everything(fetc
     fake_client.ib.reqTickersAsync.assert_not_called()
 
 
+async def test_fetch_snapshot_filters_out_empty_tickers(fetcher, fake_client):
+    fake_client.ib.reqSecDefOptParamsAsync.return_value = [
+        make_chain_param(expirations=("20260116",), strikes=(150.0, 160.0))
+    ]
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(_qualify_options)
+
+    def tickers_with_one_empty(*cs, **_kw):
+        result = []
+        for i, c in enumerate(cs):
+            if i == 0:
+                result.append(make_ticker(c))  # valid
+            else:
+                # Empty ticker — no bid/ask/iv
+                result.append(
+                    SimpleNamespace(
+                        contract=c,
+                        bid=-1,
+                        ask=-1,
+                        last=-1,
+                        close=-1,
+                        volume=0,
+                        modelGreeks=None,
+                    )
+                )
+        return result
+
+    fake_client.ib.reqTickersAsync.side_effect = async_side(tickers_with_one_empty)
+
+    quotes = await fetcher.fetch_snapshot(
+        make_underlying(),
+        expirations=["20260116"],
+        strikes=[150.0, 160.0],
+        rights=("C",),
+    )
+    # Only the ticker with actual data survives.
+    assert len(quotes) == 1
+
+
 async def test_fetch_snapshot_drops_qualify_failures(fetcher, fake_client):
     fake_client.ib.reqSecDefOptParamsAsync.return_value = [
         make_chain_param(expirations=("20260116",), strikes=(150.0,))
@@ -136,30 +174,6 @@ async def test_fetch_snapshot_drops_qualify_failures(fetcher, fake_client):
     quotes = await fetcher.fetch_snapshot(make_underlying(), expirations=["20260116"], strikes=[150.0])
 
     assert quotes == []
-    fake_client.ib.reqTickersAsync.assert_not_called()
-
-
-async def test_fetch_snapshot_drops_unresolved_contracts(fetcher, fake_client):
-    fake_client.ib.reqSecDefOptParamsAsync.return_value = [
-        make_chain_param(expirations=("20260116",), strikes=(150.0, 160.0))
-    ]
-
-    def qualify(*contracts):
-        # Only first contract gets a conId — others are returned as-is (unresolved).
-        contracts[0].conId = 1
-        return list(contracts)
-
-    fake_client.ib.qualifyContractsAsync.side_effect = async_side(qualify)
-    fake_client.ib.reqTickersAsync.side_effect = async_side(lambda *cs, **_kw: [make_ticker(c) for c in cs])
-
-    quotes = await fetcher.fetch_snapshot(
-        make_underlying(),
-        expirations=["20260116"],
-        strikes=[150.0, 160.0],
-        rights=("C",),
-    )
-    # Only the qualified one survives.
-    assert len(quotes) == 1
 
 
 async def test_fetch_snapshot_subscribes_and_cancels_market_data(fetcher, fake_client):

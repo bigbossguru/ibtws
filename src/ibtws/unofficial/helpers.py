@@ -5,9 +5,6 @@ import math
 import datetime as _dt
 from typing import Sequence
 
-from ib_async import Contract
-
-from ibtws.unofficial.client import IBKRClient
 
 logger = logging.getLogger(__name__)
 
@@ -32,20 +29,6 @@ def safe_pick_value(obj: object, attr: str, *, allow_negative: bool = False) -> 
     if not allow_negative and f < 0:
         return None
     return f
-
-
-async def fetch_spot(underlying: Contract, client: IBKRClient) -> float | None:
-    t = await client.get_market_data(underlying)
-    for attr in ("last", "close"):
-        v = safe_pick_value(t, attr)
-        if v is not None:
-            return v
-    bid = safe_pick_value(t, "bid")
-    ask = safe_pick_value(t, "ask")
-    if bid is not None and ask is not None:
-        return (bid + ask) / 2.0
-    logger.warning(f"OptionChainFetcher: spot for {underlying.symbol} unavailable — skipping auto-window")
-    return None
 
 
 def calc_dte(expiration: str) -> float:

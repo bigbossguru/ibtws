@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 from ib_async import Option
 
-from ibtws.unofficial.helpers import fetch_spot, calc_dte
+from ibtws.unofficial.helpers import calc_dte
 from ibtws.unofficial.analysis.expected_move import (
     ExpectedMoveCalculator,
     ExpectedMoveResult,
@@ -49,26 +49,6 @@ class TestQuoteMid:
 
     def test_none_when_ask_less_than_bid(self):
         assert _quote_mid(_make_quote(100, "C", bid=6.0, ask=5.0)) is None
-
-
-class TestFetchSpot:
-    async def test_returns_last(self):
-        client = MagicMock()
-        ticker = MagicMock(last=550.0, close=549.0, bid=548.0, ask=552.0)
-        client.get_market_data = AsyncMock(return_value=ticker)
-        assert await fetch_spot(MagicMock(), client) == 550.0
-
-    async def test_falls_back_to_mid(self):
-        client = MagicMock()
-        ticker = MagicMock(last=-1.0, close=-1.0, bid=548.0, ask=552.0)
-        client.get_market_data = AsyncMock(return_value=ticker)
-        assert await fetch_spot(MagicMock(), client) == 550.0
-
-    async def test_none_when_no_data(self):
-        client = MagicMock()
-        ticker = MagicMock(last=-1.0, close=-1.0, bid=-1.0, ask=-1.0)
-        client.get_market_data = AsyncMock(return_value=ticker)
-        assert await fetch_spot(MagicMock(), client) is None
 
 
 class TestCalcDte:
@@ -200,8 +180,7 @@ class TestExpectedMoveCalculator:
         assert result.hv > 0
 
     async def test_raises_when_no_spot(self, mock_client, mock_chain):
-        mock_client.get_market_data = AsyncMock(return_value=MagicMock(last=-1.0, close=-1.0, bid=-1.0, ask=-1.0))
-        mock_chain.fetch_snapshot.return_value = [_make_quote(550, "C")]
+        mock_chain.fetch_snapshot.return_value = [_make_quote(550, "C", underlying_price=None)]
         calc = ExpectedMoveCalculator(mock_client, mock_chain)
 
         with pytest.raises(ValueError, match="Cannot determine spot"):
