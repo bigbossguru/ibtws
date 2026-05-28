@@ -16,7 +16,7 @@ import numpy as np
 from ib_async import Contract
 
 from ibtws.unofficial.client import IBKRClient
-from ibtws.unofficial.helpers import calc_dte, fetch_spot
+from ibtws.unofficial.helpers import calc_dte
 from ibtws.unofficial.option.chains import OptionChainFetcher
 from ibtws.unofficial.option.models import OptionQuote
 
@@ -79,7 +79,7 @@ class ExpectedMoveCalculator:
             rights=("C", "P"),
         )
 
-        spot = await fetch_spot(underlying, self._client)
+        spot = quotes[0].underlying_price if quotes else None
         if spot is None:
             raise ValueError(f"Cannot determine spot price for {underlying.symbol}")
 
