@@ -72,6 +72,7 @@ class GEXCalculator:
         expiry_to: str | None = None,
         strike_window_pct: float = 0.15,
         use_open_interest: bool = True,
+        trading_class: str | None = None,
     ) -> GEXResult:
         """Calculate GEX for *underlying*.
 
@@ -87,6 +88,8 @@ class GEXCalculator:
             Fraction of spot to include strikes (e.g. 0.15 = ±15%).
         use_open_interest:
             Weight gamma by open interest (True) or volume (False).
+        trading_class:
+            Option trading class (e.g. "SPXW" for SPX weeklies).
         """
         quotes: list[OptionQuote] = await self._chain.fetch_snapshot(
             underlying,
@@ -94,6 +97,7 @@ class GEXCalculator:
             expiry_from=expiry_from,
             expiry_to=expiry_to,
             strike_window_pct=strike_window_pct,
+            trading_class=trading_class,
             rights=("C", "P"),
         )
 

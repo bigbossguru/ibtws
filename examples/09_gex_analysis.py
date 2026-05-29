@@ -7,7 +7,7 @@ Compute dealer gamma exposure across the SPX option chain to identify:
 - Put Wall (key support level)
 - Net GEX (directional bias)
 - Zero Gamma Level (flip point where dealer hedging reverses)
-- Per-strike histogram breakdown
+- Per-strike histogram breakdown with matplotlib visualization
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import matplotlib.pyplot as plt
+import numpy as np
 from ib_async import Index
 
 from ibtws.config import IBKRConfig
@@ -50,8 +52,57 @@ def _print(result: GEXResult) -> None:
         print(f"  {s.strike:>8.1f}  {s.call_gex:>14,.0f}  {s.put_gex:>14,.0f}  {s.net_gex:>14,.0f}")
 
 
+def _plot(result: GEXResult) -> None:
+    strikes = np.array([s.strike for s in result.strikes])
+    call_gex = np.array([s.call_gex for s in result.strikes])
+    put_gex = np.array([s.put_gex for s in result.strikes])
+    net_gex = np.array([s.net_gex for s in result.strikes])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
+    fig.suptitle(f"GEX Profile — {result.underlying_symbol} (spot: ${result.spot:.2f})", fontsize=14)
+
+    # --- Top panel: Call vs Put GEX stacked bars ---
+    width = np.min(np.diff(strikes)) * 0.4 if len(strikes) > 1 else 5.0
+    ax1.bar(strikes, call_gex, width=width, color="green", alpha=0.7, label="Call GEX")
+    ax1.bar(strikes, put_gex, width=width, color="red", alpha=0.7, label="Put GEX")
+    ax1.axvline(result.spot, color="blue", linestyle="--", linewidth=1.2, label=f"Spot ${result.spot:.0f}")
+    if result.call_wall:
+        ax1.axvline(
+            result.call_wall, color="darkgreen", linestyle=":", linewidth=1.5, label=f"Call Wall {result.call_wall:.0f}"
+        )
+    if result.put_wall:
+        ax1.axvline(
+            result.put_wall, color="darkred", linestyle=":", linewidth=1.5, label=f"Put Wall {result.put_wall:.0f}"
+        )
+    ax1.axhline(0, color="gray", linewidth=0.5)
+    ax1.set_ylabel("GEX ($)")
+    ax1.legend(loc="upper left", fontsize=9)
+    ax1.set_title("Call / Put GEX by Strike")
+
+    # --- Bottom panel: Net GEX ---
+    colors = ["green" if v >= 0 else "red" for v in net_gex]
+    ax2.bar(strikes, net_gex, width=width, color=colors, alpha=0.7)
+    ax2.axvline(result.spot, color="blue", linestyle="--", linewidth=1.2, label=f"Spot ${result.spot:.0f}")
+    if result.zero_gamma_level:
+        ax2.axvline(
+            result.zero_gamma_level,
+            color="purple",
+            linestyle="-.",
+            linewidth=1.5,
+            label=f"Zero Gamma {result.zero_gamma_level:.0f}",
+        )
+    ax2.axhline(0, color="gray", linewidth=0.5)
+    ax2.set_xlabel("Strike")
+    ax2.set_ylabel("Net GEX ($)")
+    ax2.legend(loc="upper left", fontsize=9)
+    ax2.set_title("Net GEX by Strike")
+
+    plt.tight_layout()
+    plt.show()
+
+
 async def main() -> None:
-    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=19)  # TWS paper
+    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)  # TWS paper
 
     async with IBKRClient(config) as client:
         await client.connect()
@@ -65,9 +116,12 @@ async def main() -> None:
 
         result = await calculator.calculate(
             underlying,
-            strike_window_pct=0.10,  # ±10% around spot
+            expirations=["20260601"],
+            trading_class="SPXW",
+            strike_window_pct=0.05,  # ±5% around spot
         )
         _print(result)
+        _plot(result)
 
 
 if __name__ == "__main__":
