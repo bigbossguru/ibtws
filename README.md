@@ -1,6 +1,7 @@
 # IB TWS
 [![CI](https://github.com/bigbossguru/ibtws/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bigbossguru/ibtws/actions/workflows/ci.yml) [![Release](https://github.com/bigbossguru/ibtws/actions/workflows/release.yml/badge.svg)](https://github.com/bigbossguru/ibtws/actions/workflows/release.yml) [![Update CHANGELOG](https://github.com/bigbossguru/ibtws/actions/workflows/changelog.yml/badge.svg?branch=main)](https://github.com/bigbossguru/ibtws/actions/workflows/changelog.yml)
-
+[![Latest Release](https://img.shields.io/github/v/release/bigbossguru/ibtws?label=release&logo=github&color=blue)](https://github.com/bigbossguru/ibtws/releases)
+[![Last Commit](https://img.shields.io/github/last-commit/bigbossguru/ibtws?label=last%20activity&logo=github)](https://github.com/bigbossguru/ibtws/commits/main)
 ## Contributing
 
 ### Commit message style
