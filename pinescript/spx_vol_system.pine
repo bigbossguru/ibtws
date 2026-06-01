@@ -37,10 +37,22 @@ vix_sma   = ta.sma(vix, zscore_len)
 vix_stdev = ta.stdev(vix, zscore_len)
 vix_zscore = vix_stdev != 0 ? (vix - vix_sma) / vix_stdev : 0.0
 
-// ─── METRIC 2: EXPECTED MOVE ─────────────────────────────────────────────────
+// ─── METRIC 2: EXPECTED MOVE (anchored to session open) ──────────────────────
 em_1d      = spx * (vix / 100.0) / math.sqrt(252)
 em_weekly  = spx * (vix / 100.0) / math.sqrt(252) * math.sqrt(dte_weekly)
 em_monthly = spx * (vix / 100.0) / math.sqrt(252) * math.sqrt(dte_monthly)
+
+// Capture open price and VIX at session open (9:30) — EM levels stay fixed for the day
+var float open_price = na
+var float open_vix   = na
+is_new_session = ta.change(time("D")) != 0
+if is_new_session
+    open_price := open
+    open_vix   := vix
+
+em_open_1d  = open_price * (open_vix / 100.0) / math.sqrt(252)
+em_open_w   = open_price * (open_vix / 100.0) / math.sqrt(252) * math.sqrt(dte_weekly)
+em_open_m   = open_price * (open_vix / 100.0) / math.sqrt(252) * math.sqrt(dte_monthly)
 
 // ─── METRIC 3: TERM STRUCTURE ────────────────────────────────────────────────
 ratio_macro    = vix3m != 0 ? vix / vix3m : 1.0
@@ -70,13 +82,16 @@ signal_0dte   = circuit_breaker ? 2 : sig_0dte_green ? 0 : 1
 signal_weekly  = circuit_breaker ? 2 : sig_weekly_green ? 0 : 1
 signal_monthly = circuit_breaker ? 2 : sig_monthly_green ? 0 : 1
 
-// ─── EXPECTED MOVE BANDS (filled zones) ──────────────────────────────────────
-em_up_0 = spx + em_1d
-em_dn_0 = spx - em_1d
-em_up_w = spx + em_weekly
-em_dn_w = spx - em_weekly
-em_up_m = spx + em_monthly
-em_dn_m = spx - em_monthly
+// ─── SESSION OPEN VERTICAL LINE ──────────────────────────────────────────────
+if is_new_session
+    line.new(bar_index, low - ta.atr(14), bar_index, high + ta.atr(14), color=color.new(color.white, 60), style=line.style_dashed, width=1)
+
+// ─── EXPECTED MOVE BANDS (filled zones, anchored to session open) ────────────
+em_dn_0 = open_price - em_open_1d
+em_up_w = open_price + em_open_w
+em_dn_w = open_price - em_open_w
+em_up_m = open_price + em_open_m
+em_dn_m = open_price - em_open_m
 
 p_eu_m = plot(show_em_bands ? em_up_m : na, "EM+ Monthly", color=color.new(color.purple, 80), linewidth=1)
 p_ed_m = plot(show_em_bands ? em_dn_m : na, "EM- Monthly", color=color.new(color.purple, 80), linewidth=1)
@@ -94,9 +109,9 @@ fill(p_eu_m, p_eu_w, color=color.new(color.purple, 95), title="EM Monthly Upper 
 fill(p_ed_m, p_ed_w, color=color.new(color.purple, 95), title="EM Monthly Lower Fill")
 
 // ─── STRIKE LEVELS ───────────────────────────────────────────────────────────
-strike_0dte   = spx - 1.5 * em_1d
-strike_weekly = spx - 2.0 * em_weekly
-strike_monthly = spx - 2.5 * em_monthly
+strike_0dte   = open_price - 1.5 * em_open_1d
+strike_weekly = open_price - 2.0 * em_open_w
+strike_monthly = open_price - 2.5 * em_open_m
 
 // Plot strikes only when signal is GREEN
 plot(show_strikes and signal_0dte == 0 ? strike_0dte : na, "Strike 0DTE", color=color.lime, style=plot.style_linebr, linewidth=2)
@@ -176,8 +191,8 @@ if show_dashboard and barstate.islast
     table.cell(tbl, 2, 9, vrp > 0 ? "EDGE" : "NONE", text_color=vrp > 0 ? color.green : color.red, text_size=size.tiny, text_halign=text.align_right)
 
     table.cell(tbl, 0, 10, "EM±", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 10, str.tostring(em_weekly, "#") + "w", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 10, str.tostring(em_1d, "#") + "d", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 1, 10, str.tostring(em_open_w, "#") + "w", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 10, str.tostring(em_open_1d, "#") + "d", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
 
     // ── Signals
     table.cell(tbl, 0, 11, "SIGNALS", text_color=color.new(color.aqua, 30), text_size=size.tiny, text_halign=text.align_left, bgcolor=color.new(#0f3460, 0))
