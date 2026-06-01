@@ -124,7 +124,7 @@ if show_dashboard and barstate.islast
         "Bottom Right" => position.bottom_right
         => position.bottom_left
 
-    var tbl = table.new(tbl_pos, 2, 10, border_width=1, border_color=color.new(color.gray, 70), bgcolor=color.new(#1a1a2e, 0))
+    var tbl = table.new(tbl_pos, 2, 11, border_width=1, border_color=color.new(color.gray, 70), bgcolor=color.new(#1a1a2e, 0))
 
     // VIX + Z-Score
     z_col = vix_zscore > 2 ? color.red : vix_zscore > 1 ? color.orange : vix_zscore < -2 ? color.yellow : color.white
@@ -148,26 +148,31 @@ if show_dashboard and barstate.islast
     table.cell(tbl, 0, 4, "1D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
     table.cell(tbl, 1, 4, str.tostring(ratio_intraday, "#.##") + (ratio_intraday > 1.25 ? " 🔥" : ratio_intraday > 1.0 ? " !" : ""), text_color=intra_col, text_size=size.tiny, text_halign=text.align_right)
 
+    // VVIX
+    vvix_col = vvix > 140 ? color.red : vvix > 120 ? color.orange : vvix > 90 ? color.white : color.green
+    table.cell(tbl, 0, 5, "VVIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, str.tostring(vvix, "#.#") + (vvix_declining ? " ↓" : " ↑"), text_color=vvix_col, text_size=size.tiny, text_halign=text.align_right)
+
     // EM
-    table.cell(tbl, 0, 5, "EM", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 5, "±" + str.tostring(em_open_1d, "#") + "d  ±" + str.tostring(em_open_w, "#") + "w", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 0, 6, "EM", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, "±" + str.tostring(em_open_1d, "#") + "d  ±" + str.tostring(em_open_w, "#") + "w", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
 
     // Signals
     col_0 = signal_0dte == 0 ? color.lime : signal_0dte == 1 ? color.yellow : color.red
     col_w = signal_weekly == 0 ? color.lime : signal_weekly == 1 ? color.yellow : color.red
     col_m = signal_monthly == 0 ? color.lime : signal_monthly == 1 ? color.yellow : color.red
 
-    table.cell(tbl, 0, 6, "", text_size=size.tiny, bgcolor=color.new(#0f3460, 0))
-    table.cell(tbl, 1, 6, "", text_size=size.tiny, bgcolor=color.new(#0f3460, 0))
+    table.cell(tbl, 0, 7, "", text_size=size.tiny, bgcolor=color.new(#0f3460, 0))
+    table.cell(tbl, 1, 7, "", text_size=size.tiny, bgcolor=color.new(#0f3460, 0))
 
-    table.cell(tbl, 0, 7, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 7, signal_0dte == 0 ? "GO <" + str.tostring(strike_0dte, "#") : signal_0dte == 1 ? "WAIT" : "STOP", text_color=col_0, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 0, 8, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, signal_0dte == 0 ? "GO <" + str.tostring(strike_0dte, "#") : signal_0dte == 1 ? "WAIT" : "STOP", text_color=col_0, text_size=size.tiny, text_halign=text.align_right)
 
-    table.cell(tbl, 0, 8, "WEEKLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 8, signal_weekly == 0 ? "GO <" + str.tostring(strike_weekly, "#") : signal_weekly == 1 ? "WAIT" : "STOP", text_color=col_w, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 0, 9, "WEEKLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 9, signal_weekly == 0 ? "GO <" + str.tostring(strike_weekly, "#") : signal_weekly == 1 ? "WAIT" : "STOP", text_color=col_w, text_size=size.tiny, text_halign=text.align_right)
 
-    table.cell(tbl, 0, 9, "MONTHLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 9, signal_monthly == 0 ? "GO <" + str.tostring(strike_monthly, "#") : signal_monthly == 1 ? "WAIT" : "STOP", text_color=col_m, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 0, 10, "MONTHLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 10, signal_monthly == 0 ? "GO <" + str.tostring(strike_monthly, "#") : signal_monthly == 1 ? "WAIT" : "STOP", text_color=col_m, text_size=size.tiny, text_halign=text.align_right)
 
 // ─── ALERTS ──────────────────────────────────────────────────────────────────
 alertcondition(circuit_breaker and not circuit_breaker[1], "Circuit Breaker ON", "⚠️ SPX Vol: CIRCUIT BREAKER — halt put selling")
