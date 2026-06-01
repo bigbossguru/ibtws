@@ -71,6 +71,8 @@ signal_weekly  = circuit_breaker ? 2 : sig_weekly_green ? 0 : 1
 signal_monthly = circuit_breaker ? 2 : sig_monthly_green ? 0 : 1
 
 // ─── EXPECTED MOVE BANDS (filled zones) ──────────────────────────────────────
+em_up_0 = spx + em_1d
+em_dn_0 = spx - em_1d
 em_up_w = spx + em_weekly
 em_dn_w = spx - em_weekly
 em_up_m = spx + em_monthly
@@ -80,10 +82,14 @@ p_eu_m = plot(show_em_bands ? em_up_m : na, "EM+ Monthly", color=color.new(color
 p_ed_m = plot(show_em_bands ? em_dn_m : na, "EM- Monthly", color=color.new(color.purple, 80), linewidth=1)
 p_eu_w = plot(show_em_bands ? em_up_w : na, "EM+ Weekly",  color=color.new(color.blue, 60), linewidth=2)
 p_ed_w = plot(show_em_bands ? em_dn_w : na, "EM- Weekly",  color=color.new(color.blue, 60), linewidth=2)
+p_eu_0 = plot(show_em_bands ? em_up_0 : na, "EM+ 0DTE",   color=color.new(color.orange, 50), linewidth=2, style=plot.style_stepline)
+p_ed_0 = plot(show_em_bands ? em_dn_0 : na, "EM- 0DTE",   color=color.new(color.orange, 50), linewidth=2, style=plot.style_stepline)
 p_mid  = plot(show_em_bands ? spx : na, "SPX Mid", color=color.new(color.gray, 100), display=display.none)
 
-fill(p_eu_w, p_mid, color=color.new(color.blue, 93), title="EM Weekly Upper Fill")
-fill(p_ed_w, p_mid, color=color.new(color.blue, 93), title="EM Weekly Lower Fill")
+fill(p_eu_0, p_mid, color=color.new(color.orange, 94), title="EM 0DTE Upper Fill")
+fill(p_ed_0, p_mid, color=color.new(color.orange, 94), title="EM 0DTE Lower Fill")
+fill(p_eu_w, p_eu_0, color=color.new(color.blue, 95), title="EM Weekly Upper Fill")
+fill(p_ed_w, p_ed_0, color=color.new(color.blue, 95), title="EM Weekly Lower Fill")
 fill(p_eu_m, p_eu_w, color=color.new(color.purple, 95), title="EM Monthly Upper Fill")
 fill(p_ed_m, p_ed_w, color=color.new(color.purple, 95), title="EM Monthly Lower Fill")
 
