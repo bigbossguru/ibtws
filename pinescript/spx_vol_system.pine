@@ -87,6 +87,7 @@ if is_new_session
     line.new(bar_index, low - ta.atr(14), bar_index, high + ta.atr(14), color=color.new(color.white, 60), style=line.style_dashed, width=1)
 
 // ─── EXPECTED MOVE BANDS (filled zones, anchored to session open) ────────────
+em_up_0 = open_price + em_open_1d
 em_dn_0 = open_price - em_open_1d
 em_up_w = open_price + em_open_w
 em_dn_w = open_price - em_open_w
