@@ -178,16 +178,20 @@ if show_dashboard and barstate.islast
     table.cell(tbl, 1, 11, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
     table.cell(tbl, 2, 11, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
 
-    _sc(s) => s == 0 ? color.lime : s == 1 ? color.yellow : color.red
-    _st(s) => s == 0 ? "● GREEN" : s == 1 ? "● YELLOW" : "● RED"
+    _sc = signal_0dte == 0 ? color.lime : signal_0dte == 1 ? color.yellow : color.red
+    _sw = signal_weekly == 0 ? color.lime : signal_weekly == 1 ? color.yellow : color.red
+    _sm = signal_monthly == 0 ? color.lime : signal_monthly == 1 ? color.yellow : color.red
+    _st0 = signal_0dte == 0 ? "● GREEN" : signal_0dte == 1 ? "● YELLOW" : "● RED"
+    _stw = signal_weekly == 0 ? "● GREEN" : signal_weekly == 1 ? "● YELLOW" : "● RED"
+    _stm = signal_monthly == 0 ? "● GREEN" : signal_monthly == 1 ? "● YELLOW" : "● RED"
 
     table.cell(tbl, 0, 12, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 12, _st(signal_0dte), text_color=_sc(signal_0dte), text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 1, 12, _st0, text_color=_sc, text_size=size.tiny, text_halign=text.align_right)
     table.cell(tbl, 2, 12, signal_0dte == 0 ? "<" + str.tostring(strike_0dte, "#") : "", text_color=color.lime, text_size=size.tiny, text_halign=text.align_right)
 
     table.cell(tbl, 0, 13, "WK / MO", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 13, _st(signal_weekly), text_color=_sc(signal_weekly), text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 13, _st(signal_monthly), text_color=_sc(signal_monthly), text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 1, 13, _stw, text_color=_sw, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 13, _stm, text_color=_sm, text_size=size.tiny, text_halign=text.align_right)
 
 // ─── ALERTS ──────────────────────────────────────────────────────────────────
 alertcondition(circuit_breaker and not circuit_breaker[1], "Circuit Breaker ON", "⚠️ SPX Vol: CIRCUIT BREAKER — halt put selling")
