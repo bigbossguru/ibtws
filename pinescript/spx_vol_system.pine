@@ -1,5 +1,5 @@
 // SPX Volatility Analysis System for Options Premium Selling
-// Overlay indicator with Expected Move bands, strike levels, and on-chart dashboard
+// Overlay indicator with Expected Move bands, strike levels, and compact dashboard
 //@version=5
 indicator("SPX Vol Analysis System", overlay=true, max_lines_count=500, max_labels_count=50)
 
@@ -38,7 +38,6 @@ vix_stdev = ta.stdev(vix, zscore_len)
 vix_zscore = vix_stdev != 0 ? (vix - vix_sma) / vix_stdev : 0.0
 
 // ─── METRIC 2: EXPECTED MOVE (anchored to session open) ──────────────────────
-// Capture open price and VIX at session open — EM levels stay fixed for the day
 var float open_price = na
 var float open_vix   = na
 is_new_session = session.isfirstbar
@@ -46,7 +45,6 @@ if is_new_session
     open_price := open
     open_vix   := vix
 
-// EM from session open (fixed levels)
 em_open_1d  = nz(open_price) * (nz(open_vix) / 100.0) / math.sqrt(252)
 em_open_w   = nz(open_price) * (nz(open_vix) / 100.0) / math.sqrt(252) * math.sqrt(dte_weekly)
 em_open_m   = nz(open_price) * (nz(open_vix) / 100.0) / math.sqrt(252) * math.sqrt(dte_monthly)
@@ -68,22 +66,15 @@ vvix_declining = vvix < vvix[1]
 circuit_breaker = ratio_macro > 1.15 or vix_zscore < -2.0
 
 // ─── STRATEGY SIGNALS ────────────────────────────────────────────────────────
-// 0DTE: VIX1D/VIX > 1.25 with reversal + VVIX declining
 sig_0dte_green = ratio_intraday > 1.25 and ratio_intraday < ratio_intraday[1] and vvix_declining
-// Weekly: Z > 1.5, VIX/VIX9D < 0.90, VRP > 0
 sig_weekly_green = vix_zscore > 1.5 and ratio_weekly < 0.90 and vrp > 0
-// Monthly: Z > 1.0, contango, VRP > 2
 sig_monthly_green = vix_zscore > 1.0 and ratio_macro < 1.0 and vrp > 2.0
 
 signal_0dte    = circuit_breaker ? 2 : sig_0dte_green ? 0 : 1
 signal_weekly  = circuit_breaker ? 2 : sig_weekly_green ? 0 : 1
 signal_monthly = circuit_breaker ? 2 : sig_monthly_green ? 0 : 1
 
-// ─── SESSION OPEN VERTICAL LINE ──────────────────────────────────────────────
-if is_new_session
-    line.new(bar_index, low - ta.atr(14), bar_index, high + ta.atr(14), color=color.new(color.white, 60), style=line.style_dashed, width=1)
-
-// ─── EXPECTED MOVE BANDS (filled zones, anchored to session open) ────────────
+// ─── EXPECTED MOVE BANDS ─────────────────────────────────────────────────────
 em_up_0 = nz(open_price) + em_open_1d
 em_dn_0 = nz(open_price) - em_open_1d
 em_up_w = nz(open_price) + em_open_w
@@ -112,27 +103,20 @@ strike_0dte    = nz(open_price) - 1.5 * em_open_1d
 strike_weekly  = nz(open_price) - 2.0 * em_open_w
 strike_monthly = nz(open_price) - 2.5 * em_open_m
 
-// Plot strikes only when signal is GREEN
 plot(show_strikes and signal_0dte == 0 ? strike_0dte : na, "Strike 0DTE", color=color.lime, style=plot.style_linebr, linewidth=2)
 plot(show_strikes and signal_weekly == 0 ? strike_weekly : na, "Strike Weekly", color=color.green, style=plot.style_linebr, linewidth=2)
 plot(show_strikes and signal_monthly == 0 ? strike_monthly : na, "Strike Monthly", color=color.teal, style=plot.style_linebr, linewidth=1)
 
-// ─── ON-CHART SIGNAL MARKERS ─────────────────────────────────────────────────
+// ─── ON-CHART MARKERS ────────────────────────────────────────────────────────
 plotshape(signal_0dte == 0 and signal_0dte[1] != 0, "0DTE Entry", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="0DTE")
 plotshape(signal_weekly == 0 and signal_weekly[1] != 0, "Weekly Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="WK")
-plotshape(signal_monthly == 0 and signal_monthly[1] != 0, "Monthly Entry", style=shape.diamond, location=location.belowbar, color=color.teal, size=size.tiny, text="MO")
-
-// Circuit breaker activation
 plotshape(circuit_breaker and not circuit_breaker[1], "CB ON", style=shape.xcross, location=location.abovebar, color=color.red, size=size.normal, text="HALT")
 
-// ─── BACKGROUND ──────────────────────────────────────────────────────────────
+// ─── BACKGROUND & BAR COLOR ──────────────────────────────────────────────────
 bgcolor(circuit_breaker ? color.new(color.red, 93) : na, title="Circuit Breaker BG")
-bgcolor(vix_zscore > 2.0 and not circuit_breaker ? color.new(color.orange, 94) : na, title="Panic BG")
-
-// ─── BAR COLORING ────────────────────────────────────────────────────────────
 barcolor(circuit_breaker ? color.new(color.red, 40) : vix_zscore > 2.0 ? color.new(color.orange, 40) : na, title="Regime Bar Color")
 
-// ─── DASHBOARD TABLE ─────────────────────────────────────────────────────────
+// ─── COMPACT DASHBOARD ───────────────────────────────────────────────────────
 if show_dashboard and barstate.islast
     tbl_pos = switch dash_pos
         "Top Right"    => position.top_right
@@ -140,77 +124,45 @@ if show_dashboard and barstate.islast
         "Bottom Right" => position.bottom_right
         => position.bottom_left
 
-    var tbl = table.new(tbl_pos, 3, 14, border_width=1, border_color=color.new(color.gray, 70), bgcolor=color.new(#1a1a2e, 0))
+    var tbl = table.new(tbl_pos, 2, 9, border_width=1, border_color=color.new(color.gray, 70), bgcolor=color.new(#1a1a2e, 0))
 
-    // Header
-    table.cell(tbl, 0, 0, "SPX VOL SYSTEM", text_color=color.white, bgcolor=color.new(#16213e, 0), text_size=size.small, text_halign=text.align_center)
-    table.cell(tbl, 1, 0, "", bgcolor=color.new(#16213e, 0))
-    table.cell(tbl, 2, 0, "", bgcolor=color.new(#16213e, 0))
-    table.merge_cells(tbl, 0, 0, 2, 0)
-
-    // Market Context
-    table.cell(tbl, 0, 1, "SPX",  text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 1, str.tostring(spx, "#.0"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 1, "O:" + str.tostring(nz(open_price), "#.0"), text_color=color.gray, text_size=size.tiny, text_halign=text.align_right)
-
+    // VIX + Z-Score
     z_col = vix_zscore > 2 ? color.red : vix_zscore > 1 ? color.orange : vix_zscore < -2 ? color.yellow : color.white
-    table.cell(tbl, 0, 2, "VIX",  text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 2, str.tostring(vix, "#.##"), text_color=z_col, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 2, "Z:" + str.tostring(vix_zscore, "+#.##"), text_color=z_col, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 0, 0, "VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, str.tostring(vix, "#.#") + "  Z:" + str.tostring(vix_zscore, "+#.#"), text_color=z_col, text_size=size.tiny, text_halign=text.align_right)
 
-    table.cell(tbl, 0, 3, "VVIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 3, str.tostring(vvix, "#.#"), text_color=vvix > 120 ? color.orange : color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 3, vvix_declining ? "↓ Decl" : "↑ Rise", text_color=vvix_declining ? color.green : color.orange, text_size=size.tiny, text_halign=text.align_right)
+    // VRP
+    table.cell(tbl, 0, 1, "VRP", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, str.tostring(vrp, "+#.#") + (vrp > 0 ? " ✓" : " ✗"), text_color=vrp > 0 ? color.green : color.red, text_size=size.tiny, text_halign=text.align_right)
 
-    // Term Structure
-    table.cell(tbl, 0, 4, "TERM STRUCT", text_color=color.new(color.aqua, 30), text_size=size.tiny, text_halign=text.align_left, bgcolor=color.new(#0f3460, 0))
-    table.cell(tbl, 1, 4, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
-    table.cell(tbl, 2, 4, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
+    // Term Structure (macro)
+    table.cell(tbl, 0, 2, "VIX/3M", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, str.tostring(ratio_macro, "#.##") + (ratio_macro > 1.0 ? " BW" : " CT"), text_color=ratio_macro > 1.0 ? color.red : color.green, text_size=size.tiny, text_halign=text.align_right)
 
-    table.cell(tbl, 0, 5, "VIX/3M", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 5, str.tostring(ratio_macro, "#.##"), text_color=ratio_macro > 1.0 ? color.red : color.green, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 5, ratio_macro > 1.0 ? "BW" : "CT", text_color=ratio_macro > 1.0 ? color.red : color.green, text_size=size.tiny, text_halign=text.align_right)
+    // VIX1D/VIX
+    table.cell(tbl, 0, 3, "1D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(ratio_intraday, "#.##") + (ratio_intraday > 1.25 ? " 🔥" : ratio_intraday > 1.0 ? " !" : ""), text_color=ratio_intraday > 1.0 ? color.red : color.white, text_size=size.tiny, text_halign=text.align_right)
 
-    table.cell(tbl, 0, 6, "VIX/9D", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 6, str.tostring(ratio_weekly, "#.##"), text_color=ratio_weekly < 1.0 ? color.orange : color.green, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 6, ratio_weekly < 1.0 ? "LBW" : "CT", text_color=ratio_weekly < 1.0 ? color.orange : color.green, text_size=size.tiny, text_halign=text.align_right)
-
-    table.cell(tbl, 0, 7, "1D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 7, str.tostring(ratio_intraday, "#.##"), text_color=ratio_intraday > 1.0 ? color.red : color.green, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 7, ratio_intraday > 1.25 ? "🔥" : ratio_intraday > 1.0 ? "HOT" : "OK", text_color=ratio_intraday > 1.0 ? color.red : color.green, text_size=size.tiny, text_halign=text.align_right)
-
-    // Risk
-    table.cell(tbl, 0, 8, "RISK", text_color=color.new(color.aqua, 30), text_size=size.tiny, text_halign=text.align_left, bgcolor=color.new(#0f3460, 0))
-    table.cell(tbl, 1, 8, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
-    table.cell(tbl, 2, 8, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
-
-    table.cell(tbl, 0, 9, "VRP", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 9, str.tostring(vrp, "+#.#"), text_color=vrp > 0 ? color.green : color.red, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 9, vrp > 0 ? "EDGE" : "NONE", text_color=vrp > 0 ? color.green : color.red, text_size=size.tiny, text_halign=text.align_right)
-
-    table.cell(tbl, 0, 10, "EM±", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 10, str.tostring(em_open_w, "#") + "w", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 10, str.tostring(em_open_1d, "#") + "d", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    // EM
+    table.cell(tbl, 0, 4, "EM", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, "±" + str.tostring(em_open_1d, "#") + "d  ±" + str.tostring(em_open_w, "#") + "w", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
 
     // Signals
-    table.cell(tbl, 0, 11, "SIGNALS", text_color=color.new(color.aqua, 30), text_size=size.tiny, text_halign=text.align_left, bgcolor=color.new(#0f3460, 0))
-    table.cell(tbl, 1, 11, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
-    table.cell(tbl, 2, 11, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
+    col_0 = signal_0dte == 0 ? color.lime : signal_0dte == 1 ? color.yellow : color.red
+    col_w = signal_weekly == 0 ? color.lime : signal_weekly == 1 ? color.yellow : color.red
+    col_m = signal_monthly == 0 ? color.lime : signal_monthly == 1 ? color.yellow : color.red
 
-    col_0dte = signal_0dte == 0 ? color.lime : signal_0dte == 1 ? color.yellow : color.red
-    col_wk   = signal_weekly == 0 ? color.lime : signal_weekly == 1 ? color.yellow : color.red
-    col_mo   = signal_monthly == 0 ? color.lime : signal_monthly == 1 ? color.yellow : color.red
-    txt_0dte = signal_0dte == 0 ? "● GREEN" : signal_0dte == 1 ? "● YELLOW" : "● RED"
-    txt_wk   = signal_weekly == 0 ? "● GREEN" : signal_weekly == 1 ? "● YELLOW" : "● RED"
-    txt_mo   = signal_monthly == 0 ? "● GREEN" : signal_monthly == 1 ? "● YELLOW" : "● RED"
+    table.cell(tbl, 0, 5, "", text_size=size.tiny, bgcolor=color.new(#0f3460, 0))
+    table.cell(tbl, 1, 5, "", text_size=size.tiny, bgcolor=color.new(#0f3460, 0))
 
-    table.cell(tbl, 0, 12, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 12, txt_0dte, text_color=col_0dte, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 12, signal_0dte == 0 ? "<" + str.tostring(strike_0dte, "#") : "", text_color=color.lime, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 0, 6, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, signal_0dte == 0 ? "GO <" + str.tostring(strike_0dte, "#") : signal_0dte == 1 ? "WAIT" : "STOP", text_color=col_0, text_size=size.tiny, text_halign=text.align_right)
 
-    table.cell(tbl, 0, 13, "WK / MO", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 13, txt_wk, text_color=col_wk, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 13, txt_mo, text_color=col_mo, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 0, 7, "WEEKLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, signal_weekly == 0 ? "GO <" + str.tostring(strike_weekly, "#") : signal_weekly == 1 ? "WAIT" : "STOP", text_color=col_w, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 8, "MONTHLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, signal_monthly == 0 ? "GO <" + str.tostring(strike_monthly, "#") : signal_monthly == 1 ? "WAIT" : "STOP", text_color=col_m, text_size=size.tiny, text_halign=text.align_right)
 
 // ─── ALERTS ──────────────────────────────────────────────────────────────────
 alertcondition(circuit_breaker and not circuit_breaker[1], "Circuit Breaker ON", "⚠️ SPX Vol: CIRCUIT BREAKER — halt put selling")
