@@ -144,8 +144,9 @@ if show_dashboard and barstate.islast
     table.cell(tbl, 1, 3, str.tostring(ratio_weekly, "#.##") + (ratio_weekly < 1.0 ? " LBW" : " CT"), text_color=ratio_weekly < 1.0 ? color.orange : color.green, text_size=size.tiny, text_halign=text.align_right)
 
     // VIX1D/VIX
+    intra_col = ratio_intraday > 1.25 ? color.red : ratio_intraday > 1.0 ? color.orange : ratio_intraday > 0.85 ? color.white : color.green
     table.cell(tbl, 0, 4, "1D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 4, str.tostring(ratio_intraday, "#.##") + (ratio_intraday > 1.25 ? " 🔥" : ratio_intraday > 1.0 ? " !" : ""), text_color=ratio_intraday > 1.0 ? color.red : color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 1, 4, str.tostring(ratio_intraday, "#.##") + (ratio_intraday > 1.25 ? " 🔥" : ratio_intraday > 1.0 ? " !" : ""), text_color=intra_col, text_size=size.tiny, text_halign=text.align_right)
 
     // EM
     table.cell(tbl, 0, 5, "EM", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
