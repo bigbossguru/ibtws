@@ -38,21 +38,18 @@ vix_stdev = ta.stdev(vix, zscore_len)
 vix_zscore = vix_stdev != 0 ? (vix - vix_sma) / vix_stdev : 0.0
 
 // ─── METRIC 2: EXPECTED MOVE (anchored to session open) ──────────────────────
-em_1d      = spx * (vix / 100.0) / math.sqrt(252)
-em_weekly  = spx * (vix / 100.0) / math.sqrt(252) * math.sqrt(dte_weekly)
-em_monthly = spx * (vix / 100.0) / math.sqrt(252) * math.sqrt(dte_monthly)
-
-// Capture open price and VIX at session open (9:30) — EM levels stay fixed for the day
+// Capture open price and VIX at session open — EM levels stay fixed for the day
 var float open_price = na
 var float open_vix   = na
-is_new_session = ta.change(time("D")) != 0
+is_new_session = session.isfirstbar
 if is_new_session
     open_price := open
     open_vix   := vix
 
-em_open_1d  = open_price * (open_vix / 100.0) / math.sqrt(252)
-em_open_w   = open_price * (open_vix / 100.0) / math.sqrt(252) * math.sqrt(dte_weekly)
-em_open_m   = open_price * (open_vix / 100.0) / math.sqrt(252) * math.sqrt(dte_monthly)
+// EM from session open (fixed levels)
+em_open_1d  = nz(open_price) * (nz(open_vix) / 100.0) / math.sqrt(252)
+em_open_w   = nz(open_price) * (nz(open_vix) / 100.0) / math.sqrt(252) * math.sqrt(dte_weekly)
+em_open_m   = nz(open_price) * (nz(open_vix) / 100.0) / math.sqrt(252) * math.sqrt(dte_monthly)
 
 // ─── METRIC 3: TERM STRUCTURE ────────────────────────────────────────────────
 ratio_macro    = vix3m != 0 ? vix / vix3m : 1.0
@@ -71,14 +68,14 @@ vvix_declining = vvix < vvix[1]
 circuit_breaker = ratio_macro > 1.15 or vix_zscore < -2.0
 
 // ─── STRATEGY SIGNALS ────────────────────────────────────────────────────────
-// 0DTE
+// 0DTE: VIX1D/VIX > 1.25 with reversal + VVIX declining
 sig_0dte_green = ratio_intraday > 1.25 and ratio_intraday < ratio_intraday[1] and vvix_declining
-// Weekly
+// Weekly: Z > 1.5, VIX/VIX9D < 0.90, VRP > 0
 sig_weekly_green = vix_zscore > 1.5 and ratio_weekly < 0.90 and vrp > 0
-// Monthly
+// Monthly: Z > 1.0, contango, VRP > 2
 sig_monthly_green = vix_zscore > 1.0 and ratio_macro < 1.0 and vrp > 2.0
 
-signal_0dte   = circuit_breaker ? 2 : sig_0dte_green ? 0 : 1
+signal_0dte    = circuit_breaker ? 2 : sig_0dte_green ? 0 : 1
 signal_weekly  = circuit_breaker ? 2 : sig_weekly_green ? 0 : 1
 signal_monthly = circuit_breaker ? 2 : sig_monthly_green ? 0 : 1
 
@@ -87,12 +84,13 @@ if is_new_session
     line.new(bar_index, low - ta.atr(14), bar_index, high + ta.atr(14), color=color.new(color.white, 60), style=line.style_dashed, width=1)
 
 // ─── EXPECTED MOVE BANDS (filled zones, anchored to session open) ────────────
-em_up_0 = open_price + em_open_1d
-em_dn_0 = open_price - em_open_1d
-em_up_w = open_price + em_open_w
-em_dn_w = open_price - em_open_w
-em_up_m = open_price + em_open_m
-em_dn_m = open_price - em_open_m
+em_up_0 = nz(open_price) + em_open_1d
+em_dn_0 = nz(open_price) - em_open_1d
+em_up_w = nz(open_price) + em_open_w
+em_dn_w = nz(open_price) - em_open_w
+em_up_m = nz(open_price) + em_open_m
+em_dn_m = nz(open_price) - em_open_m
+em_mid  = nz(open_price)
 
 p_eu_m = plot(show_em_bands ? em_up_m : na, "EM+ Monthly", color=color.new(color.purple, 80), linewidth=1)
 p_ed_m = plot(show_em_bands ? em_dn_m : na, "EM- Monthly", color=color.new(color.purple, 80), linewidth=1)
@@ -100,7 +98,7 @@ p_eu_w = plot(show_em_bands ? em_up_w : na, "EM+ Weekly",  color=color.new(color
 p_ed_w = plot(show_em_bands ? em_dn_w : na, "EM- Weekly",  color=color.new(color.blue, 60), linewidth=2)
 p_eu_0 = plot(show_em_bands ? em_up_0 : na, "EM+ 0DTE",   color=color.new(color.orange, 50), linewidth=2, style=plot.style_stepline)
 p_ed_0 = plot(show_em_bands ? em_dn_0 : na, "EM- 0DTE",   color=color.new(color.orange, 50), linewidth=2, style=plot.style_stepline)
-p_mid  = plot(show_em_bands ? spx : na, "SPX Mid", color=color.new(color.gray, 100), display=display.none)
+p_mid  = plot(show_em_bands ? em_mid  : na, "Open Price",  color=color.new(color.white, 70), linewidth=1, style=plot.style_stepline)
 
 fill(p_eu_0, p_mid, color=color.new(color.orange, 94), title="EM 0DTE Upper Fill")
 fill(p_ed_0, p_mid, color=color.new(color.orange, 94), title="EM 0DTE Lower Fill")
@@ -110,9 +108,9 @@ fill(p_eu_m, p_eu_w, color=color.new(color.purple, 95), title="EM Monthly Upper 
 fill(p_ed_m, p_ed_w, color=color.new(color.purple, 95), title="EM Monthly Lower Fill")
 
 // ─── STRIKE LEVELS ───────────────────────────────────────────────────────────
-strike_0dte   = open_price - 1.5 * em_open_1d
-strike_weekly = open_price - 2.0 * em_open_w
-strike_monthly = open_price - 2.5 * em_open_m
+strike_0dte    = nz(open_price) - 1.5 * em_open_1d
+strike_weekly  = nz(open_price) - 2.0 * em_open_w
+strike_monthly = nz(open_price) - 2.5 * em_open_m
 
 // Plot strikes only when signal is GREEN
 plot(show_strikes and signal_0dte == 0 ? strike_0dte : na, "Strike 0DTE", color=color.lime, style=plot.style_linebr, linewidth=2)
@@ -120,7 +118,6 @@ plot(show_strikes and signal_weekly == 0 ? strike_weekly : na, "Strike Weekly", 
 plot(show_strikes and signal_monthly == 0 ? strike_monthly : na, "Strike Monthly", color=color.teal, style=plot.style_linebr, linewidth=1)
 
 // ─── ON-CHART SIGNAL MARKERS ─────────────────────────────────────────────────
-// Entry arrows when signal flips to GREEN
 plotshape(signal_0dte == 0 and signal_0dte[1] != 0, "0DTE Entry", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="0DTE")
 plotshape(signal_weekly == 0 and signal_weekly[1] != 0, "Weekly Entry", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="WK")
 plotshape(signal_monthly == 0 and signal_monthly[1] != 0, "Monthly Entry", style=shape.diamond, location=location.belowbar, color=color.teal, size=size.tiny, text="MO")
@@ -132,7 +129,7 @@ plotshape(circuit_breaker and not circuit_breaker[1], "CB ON", style=shape.xcros
 bgcolor(circuit_breaker ? color.new(color.red, 93) : na, title="Circuit Breaker BG")
 bgcolor(vix_zscore > 2.0 and not circuit_breaker ? color.new(color.orange, 94) : na, title="Panic BG")
 
-// ─── BAR COLORING (subtle regime hint) ───────────────────────────────────────
+// ─── BAR COLORING ────────────────────────────────────────────────────────────
 barcolor(circuit_breaker ? color.new(color.red, 40) : vix_zscore > 2.0 ? color.new(color.orange, 40) : na, title="Regime Bar Color")
 
 // ─── DASHBOARD TABLE ─────────────────────────────────────────────────────────
@@ -145,16 +142,16 @@ if show_dashboard and barstate.islast
 
     var tbl = table.new(tbl_pos, 3, 14, border_width=1, border_color=color.new(color.gray, 70), bgcolor=color.new(#1a1a2e, 0))
 
-    // ── Header
+    // Header
     table.cell(tbl, 0, 0, "SPX VOL SYSTEM", text_color=color.white, bgcolor=color.new(#16213e, 0), text_size=size.small, text_halign=text.align_center)
     table.cell(tbl, 1, 0, "", bgcolor=color.new(#16213e, 0))
     table.cell(tbl, 2, 0, "", bgcolor=color.new(#16213e, 0))
     table.merge_cells(tbl, 0, 0, 2, 0)
 
-    // ── Market Context
+    // Market Context
     table.cell(tbl, 0, 1, "SPX",  text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
     table.cell(tbl, 1, 1, str.tostring(spx, "#.0"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 1, "", text_size=size.tiny)
+    table.cell(tbl, 2, 1, "O:" + str.tostring(nz(open_price), "#.0"), text_color=color.gray, text_size=size.tiny, text_halign=text.align_right)
 
     z_col = vix_zscore > 2 ? color.red : vix_zscore > 1 ? color.orange : vix_zscore < -2 ? color.yellow : color.white
     table.cell(tbl, 0, 2, "VIX",  text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
@@ -165,7 +162,7 @@ if show_dashboard and barstate.islast
     table.cell(tbl, 1, 3, str.tostring(vvix, "#.#"), text_color=vvix > 120 ? color.orange : color.white, text_size=size.tiny, text_halign=text.align_right)
     table.cell(tbl, 2, 3, vvix_declining ? "↓ Decl" : "↑ Rise", text_color=vvix_declining ? color.green : color.orange, text_size=size.tiny, text_halign=text.align_right)
 
-    // ── Term Structure
+    // Term Structure
     table.cell(tbl, 0, 4, "TERM STRUCT", text_color=color.new(color.aqua, 30), text_size=size.tiny, text_halign=text.align_left, bgcolor=color.new(#0f3460, 0))
     table.cell(tbl, 1, 4, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
     table.cell(tbl, 2, 4, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
@@ -182,7 +179,7 @@ if show_dashboard and barstate.islast
     table.cell(tbl, 1, 7, str.tostring(ratio_intraday, "#.##"), text_color=ratio_intraday > 1.0 ? color.red : color.green, text_size=size.tiny, text_halign=text.align_right)
     table.cell(tbl, 2, 7, ratio_intraday > 1.25 ? "🔥" : ratio_intraday > 1.0 ? "HOT" : "OK", text_color=ratio_intraday > 1.0 ? color.red : color.green, text_size=size.tiny, text_halign=text.align_right)
 
-    // ── Risk
+    // Risk
     table.cell(tbl, 0, 8, "RISK", text_color=color.new(color.aqua, 30), text_size=size.tiny, text_halign=text.align_left, bgcolor=color.new(#0f3460, 0))
     table.cell(tbl, 1, 8, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
     table.cell(tbl, 2, 8, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
@@ -195,25 +192,25 @@ if show_dashboard and barstate.islast
     table.cell(tbl, 1, 10, str.tostring(em_open_w, "#") + "w", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
     table.cell(tbl, 2, 10, str.tostring(em_open_1d, "#") + "d", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
 
-    // ── Signals
+    // Signals
     table.cell(tbl, 0, 11, "SIGNALS", text_color=color.new(color.aqua, 30), text_size=size.tiny, text_halign=text.align_left, bgcolor=color.new(#0f3460, 0))
     table.cell(tbl, 1, 11, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
     table.cell(tbl, 2, 11, "", bgcolor=color.new(#0f3460, 0), text_size=size.tiny)
 
-    _sc = signal_0dte == 0 ? color.lime : signal_0dte == 1 ? color.yellow : color.red
-    _sw = signal_weekly == 0 ? color.lime : signal_weekly == 1 ? color.yellow : color.red
-    _sm = signal_monthly == 0 ? color.lime : signal_monthly == 1 ? color.yellow : color.red
-    _st0 = signal_0dte == 0 ? "● GREEN" : signal_0dte == 1 ? "● YELLOW" : "● RED"
-    _stw = signal_weekly == 0 ? "● GREEN" : signal_weekly == 1 ? "● YELLOW" : "● RED"
-    _stm = signal_monthly == 0 ? "● GREEN" : signal_monthly == 1 ? "● YELLOW" : "● RED"
+    col_0dte = signal_0dte == 0 ? color.lime : signal_0dte == 1 ? color.yellow : color.red
+    col_wk   = signal_weekly == 0 ? color.lime : signal_weekly == 1 ? color.yellow : color.red
+    col_mo   = signal_monthly == 0 ? color.lime : signal_monthly == 1 ? color.yellow : color.red
+    txt_0dte = signal_0dte == 0 ? "● GREEN" : signal_0dte == 1 ? "● YELLOW" : "● RED"
+    txt_wk   = signal_weekly == 0 ? "● GREEN" : signal_weekly == 1 ? "● YELLOW" : "● RED"
+    txt_mo   = signal_monthly == 0 ? "● GREEN" : signal_monthly == 1 ? "● YELLOW" : "● RED"
 
     table.cell(tbl, 0, 12, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 12, _st0, text_color=_sc, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 1, 12, txt_0dte, text_color=col_0dte, text_size=size.tiny, text_halign=text.align_right)
     table.cell(tbl, 2, 12, signal_0dte == 0 ? "<" + str.tostring(strike_0dte, "#") : "", text_color=color.lime, text_size=size.tiny, text_halign=text.align_right)
 
     table.cell(tbl, 0, 13, "WK / MO", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 13, _stw, text_color=_sw, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 13, _stm, text_color=_sm, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 1, 13, txt_wk, text_color=col_wk, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 13, txt_mo, text_color=col_mo, text_size=size.tiny, text_halign=text.align_right)
 
 // ─── ALERTS ──────────────────────────────────────────────────────────────────
 alertcondition(circuit_breaker and not circuit_breaker[1], "Circuit Breaker ON", "⚠️ SPX Vol: CIRCUIT BREAKER — halt put selling")
