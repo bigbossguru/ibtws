@@ -1,0 +1,185 @@
+// SPX Volatility Analysis System for Options Premium Selling
+// Implements: VIX Z-Score, Expected Move, Term Structure, VRP, Strategy Signals & Dashboard
+//@version=5
+indicator("SPX Vol Analysis System", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+grp_data = "Data Sources"
+vix_sym      = input.symbol("CBOE:VIX",   "VIX",        group=grp_data)
+vix1d_sym    = input.symbol("CBOE:VIX1D", "VIX1D",      group=grp_data)
+vix9d_sym    = input.symbol("CBOE:VIX9D", "VIX9D",      group=grp_data)
+vix3m_sym    = input.symbol("CBOE:VIX3M", "VIX3M",      group=grp_data)
+vvix_sym     = input.symbol("CBOE:VVIX",  "VVIX",       group=grp_data)
+
+grp_params = "Parameters"
+zscore_len   = input.int(20, "Z-Score Lookback", minval=5, group=grp_params)
+rv_len       = input.int(20, "Realized Vol Lookback", minval=5, group=grp_params)
+dte_weekly   = input.int(7,  "Weekly DTE", minval=1, group=grp_params)
+dte_monthly  = input.int(30, "Monthly DTE", minval=14, group=grp_params)
+
+grp_display = "Display"
+show_em_lines = input.bool(true, "Show Expected Move Lines", group=grp_display)
+show_dashboard = input.bool(true, "Show Dashboard", group=grp_display)
+dash_pos     = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_display)
+
+// ─── DATA REQUESTS ───────────────────────────────────────────────────────────
+vix   = request.security(vix_sym,   timeframe.period, close)
+vix1d = request.security(vix1d_sym, timeframe.period, close)
+vix9d = request.security(vix9d_sym, timeframe.period, close)
+vix3m = request.security(vix3m_sym, timeframe.period, close)
+vvix  = request.security(vvix_sym,  timeframe.period, close)
+
+spx = close  // Assumes indicator is on SPX chart
+
+// ─── METRIC 1: VIX Z-SCORE (20-DAY) ─────────────────────────────────────────
+vix_sma   = ta.sma(vix, zscore_len)
+vix_stdev = ta.stdev(vix, zscore_len)
+vix_zscore = vix_stdev != 0 ? (vix - vix_sma) / vix_stdev : 0.0
+
+// ─── METRIC 2: EXPECTED MOVE ─────────────────────────────────────────────────
+em_weekly  = spx * (vix / 100.0) / math.sqrt(252) * math.sqrt(dte_weekly)
+em_monthly = spx * (vix / 100.0) / math.sqrt(252) * math.sqrt(dte_monthly)
+
+// ─── METRIC 3: TERM STRUCTURE ────────────────────────────────────────────────
+ratio_macro    = vix3m != 0 ? vix / vix3m : 1.0   // VIX / VIX3M
+ratio_weekly   = vix9d != 0 ? vix / vix9d : 1.0   // VIX / VIX9D
+ratio_intraday = vix   != 0 ? vix1d / vix : 1.0   // VIX1D / VIX
+
+// ─── METRIC 4: VRP (Volatility Risk Premium) ────────────────────────────────
+log_returns = math.log(close / close[1])
+rv_20 = ta.stdev(log_returns, rv_len) * math.sqrt(252) * 100
+vrp = vix - rv_20
+
+// ─── METRIC 5: VVIX DECLINING ────────────────────────────────────────────────
+vvix_declining = vvix < vvix[1]
+
+// ─── CIRCUIT BREAKER ─────────────────────────────────────────────────────────
+cb_backwardation = ratio_macro > 1.15
+cb_squeeze       = vix_zscore < -2.0
+cb_futures_inv   = false  // No futures data in TV; disabled
+circuit_breaker  = cb_backwardation or cb_squeeze
+
+// ─── STRATEGY SIGNALS ────────────────────────────────────────────────────────
+// 0DTE: VIX1D/VIX > 1.25 reversal + VVIX declining
+sig_0dte_green  = ratio_intraday > 1.25 and ratio_intraday < ratio_intraday[1] and vvix_declining
+sig_0dte_yellow = ratio_intraday > 1.10 and not sig_0dte_green
+
+// Weekly: Z > 1.5, VIX/VIX9D < 0.90, VRP > 0
+sig_weekly_green = vix_zscore > 1.5 and ratio_weekly < 0.90 and vrp > 0
+
+// Monthly: Z > 1.0, contango, VRP > 2
+sig_monthly_green = vix_zscore > 1.0 and ratio_macro < 1.0 and vrp > 2.0
+
+// Final signals with circuit breaker override
+signal_0dte  = circuit_breaker ? 2 : sig_0dte_green ? 0 : 1   // 0=GREEN, 1=YELLOW, 2=RED
+signal_weekly = circuit_breaker ? 2 : sig_weekly_green ? 0 : 1
+signal_monthly = circuit_breaker ? 2 : sig_monthly_green ? 0 : 1
+
+// ─── EXPECTED MOVE LINES ─────────────────────────────────────────────────────
+em_upper_w = spx + em_weekly
+em_lower_w = spx - em_weekly
+em_upper_m = spx + em_monthly
+em_lower_m = spx - em_monthly
+
+plot(show_em_lines ? em_upper_w : na, "EM Upper (Weekly)", color=color.new(color.blue, 40), style=plot.style_stepline, linewidth=1)
+plot(show_em_lines ? em_lower_w : na, "EM Lower (Weekly)", color=color.new(color.blue, 40), style=plot.style_stepline, linewidth=1)
+plot(show_em_lines ? em_upper_m : na, "EM Upper (Monthly)", color=color.new(color.purple, 60), style=plot.style_stepline, linewidth=1)
+plot(show_em_lines ? em_lower_m : na, "EM Lower (Monthly)", color=color.new(color.purple, 60), style=plot.style_stepline, linewidth=1)
+
+// Short strike recommendations
+strike_0dte   = spx - 1.5 * em_weekly / math.sqrt(dte_weekly)  // 1.5x 1-day EM
+strike_weekly = spx - 2.0 * em_weekly
+strike_monthly = spx - 2.5 * em_monthly
+
+plot(show_em_lines and signal_0dte == 0 ? strike_0dte : na, "0DTE Strike", color=color.new(color.green, 30), style=plot.style_circles, linewidth=2)
+plot(show_em_lines and signal_weekly == 0 ? strike_weekly : na, "Weekly Strike", color=color.new(color.green, 30), style=plot.style_cross, linewidth=2)
+
+// ─── BACKGROUND COLOR ────────────────────────────────────────────────────────
+bg_col = circuit_breaker ? color.new(color.red, 92) : vix_zscore > 2.0 ? color.new(color.orange, 92) : vix_zscore < -2.0 ? color.new(color.yellow, 92) : na
+bgcolor(bg_col, title="Regime Background")
+
+// ─── DASHBOARD TABLE ─────────────────────────────────────────────────────────
+if show_dashboard and barstate.islast
+    pos_y = str.contains(dash_pos, "Top") ? position.top_right : position.bottom_right
+    pos_x = str.contains(dash_pos, "Right") ? (str.contains(dash_pos, "Top") ? position.top_right : position.bottom_right) : (str.contains(dash_pos, "Top") ? position.top_left : position.bottom_left)
+
+    var tbl = table.new(pos_x, 2, 18, border_width=1)
+
+    // Header
+    table.cell(tbl, 0, 0, "SPX VOL ANALYSIS", text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, "", bgcolor=color.new(color.blue, 20))
+
+    // Market Context
+    table.cell(tbl, 0, 1, "SPX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, str.tostring(spx, "#.00"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 2, "VIX (Z-Score)", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    z_col = vix_zscore > 2 ? color.red : vix_zscore > 1 ? color.orange : vix_zscore < -2 ? color.yellow : color.white
+    table.cell(tbl, 1, 2, str.tostring(vix, "#.##") + " (" + str.tostring(vix_zscore, "+#.##") + ")", text_color=z_col, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 3, "VVIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(vvix, "#.##") + (vvix_declining ? " ↓" : " ↑"), text_color=vvix > 120 ? color.orange : color.white, text_size=size.tiny, text_halign=text.align_right)
+
+    // Term Structure
+    table.cell(tbl, 0, 4, "── TERM STRUCTURE ──", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, "", text_size=size.tiny)
+
+    table.cell(tbl, 0, 5, "VIX/VIX3M", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    macro_col = ratio_macro > 1.0 ? color.red : color.green
+    table.cell(tbl, 1, 5, str.tostring(ratio_macro, "#.###") + (ratio_macro > 1.0 ? " BACKW" : " CONT"), text_color=macro_col, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 6, "VIX/VIX9D", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    weekly_col = ratio_weekly < 1.0 ? color.orange : color.green
+    table.cell(tbl, 1, 6, str.tostring(ratio_weekly, "#.###") + (ratio_weekly < 1.0 ? " LOCAL BW" : " CONT"), text_color=weekly_col, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 7, "VIX1D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    intra_col = ratio_intraday > 1.0 ? color.red : color.green
+    table.cell(tbl, 1, 7, str.tostring(ratio_intraday, "#.###") + (ratio_intraday > 1.0 ? " HOT" : " CALM"), text_color=intra_col, text_size=size.tiny, text_halign=text.align_right)
+
+    // Risk Metrics
+    table.cell(tbl, 0, 8, "── RISK FILTER ──", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, "", text_size=size.tiny)
+
+    table.cell(tbl, 0, 9, "VRP (VIX-RV20)", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    vrp_col = vrp > 0 ? color.green : color.red
+    table.cell(tbl, 1, 9, str.tostring(vrp, "+#.#") + "%" + (vrp > 0 ? " EDGE" : " NO EDGE"), text_color=vrp_col, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 10, "RV20", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 10, str.tostring(rv_20, "#.#") + "%", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 11, "EM (Weekly ±)", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 11, str.tostring(em_weekly, "#.0") + " pts", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+
+    // Strategy Signals
+    table.cell(tbl, 0, 12, "── STRATEGIES ──", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 12, "", text_size=size.tiny)
+
+    sig_text_0 = signal_0dte == 0 ? "🟢 GREEN" : signal_0dte == 1 ? "🟡 YELLOW" : "🔴 RED"
+    sig_col_0  = signal_0dte == 0 ? color.green : signal_0dte == 1 ? color.yellow : color.red
+    table.cell(tbl, 0, 13, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 13, sig_text_0, text_color=sig_col_0, text_size=size.tiny, text_halign=text.align_right)
+
+    sig_text_w = signal_weekly == 0 ? "🟢 GREEN" : signal_weekly == 1 ? "🟡 YELLOW" : "🔴 RED"
+    sig_col_w  = signal_weekly == 0 ? color.green : signal_weekly == 1 ? color.yellow : color.red
+    table.cell(tbl, 0, 14, "Weekly (7 DTE)", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 14, sig_text_w, text_color=sig_col_w, text_size=size.tiny, text_halign=text.align_right)
+
+    sig_text_m = signal_monthly == 0 ? "🟢 GREEN" : signal_monthly == 1 ? "🟡 YELLOW" : "🔴 RED"
+    sig_col_m  = signal_monthly == 0 ? color.green : signal_monthly == 1 ? color.yellow : color.red
+    table.cell(tbl, 0, 15, "Monthly (30 DTE)", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 15, sig_text_m, text_color=sig_col_m, text_size=size.tiny, text_halign=text.align_right)
+
+    // Circuit Breaker
+    table.cell(tbl, 0, 16, "── CIRCUIT BREAKER ──", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 16, "", text_size=size.tiny)
+
+    cb_text = circuit_breaker ? "⚠️ ON — HALT" : "OFF — OK"
+    cb_col  = circuit_breaker ? color.red : color.green
+    table.cell(tbl, 0, 17, "Status", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 17, cb_text, text_color=cb_col, text_size=size.tiny, text_halign=text.align_right)
+
+// ─── ALERTS ──────────────────────────────────────────────────────────────────
+alertcondition(circuit_breaker and not circuit_breaker[1], "Circuit Breaker ON", "⚠️ SPX Vol System: Circuit Breaker ACTIVATED — halt all put selling")
+alertcondition(sig_0dte_green and not sig_0dte_green[1], "0DTE GREEN", "🟢 0DTE Entry Signal — VIX1D spike reversal + VVIX declining")
+alertcondition(sig_weekly_green and not sig_weekly_green[1], "Weekly GREEN", "🟢 Weekly Entry Signal — Z>1.5, short-term fear spike, VRP positive")
+alertcondition(sig_monthly_green and not sig_monthly_green[1], "Monthly GREEN", "🟢 Monthly Entry Signal — elevated vol, contango, strong VRP")

@@ -60,6 +60,7 @@ class ExpectedMoveCalculator:
         expiration: str,
         *,
         hv_lookback_days: int = 30,
+        trading_class: str | None = None,
     ) -> ExpectedMoveResult:
         """Calculate expected move for *underlying* at *expiration* (YYYYMMDD).
 
@@ -75,8 +76,9 @@ class ExpectedMoveCalculator:
         quotes = await self._chain.fetch_snapshot(
             underlying,
             expirations=[expiration],
-            strike_window_pct=0.05,
+            strike_window_pct=0.1,
             rights=("C", "P"),
+            trading_class=trading_class,
         )
 
         spot = quotes[0].underlying_price if quotes else None
