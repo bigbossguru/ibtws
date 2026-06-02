@@ -226,6 +226,11 @@ plotshape(circuit_breaker and not circuit_breaker[1], "CB ON", style=shape.xcros
 bgcolor(circuit_breaker ? color.new(color.red, 93) : na, title="Circuit Breaker BG")
 barcolor(circuit_breaker ? color.new(color.red, 40) : vix_zscore > 2.0 ? color.new(color.orange, 40) : na, title="Regime Bar Color")
 
+// ─── HELPER FUNCTIONS ────────────────────────────────────────────────────────
+f_light(int s) => s > 0 ? "🟢" : s < 0 ? "🔴" : "🟡"
+f_sig(int sig) => sig == 0 ? "GO" : sig == 1 ? "WAIT" : "STOP"
+f_sig_col(int sig) => sig == 0 ? color.lime : sig == 1 ? color.yellow : color.red
+
 // ─── DASHBOARD ───────────────────────────────────────────────────────────────
 if show_dashboard and barstate.islast
     tbl_pos = switch dash_pos
@@ -235,8 +240,6 @@ if show_dashboard and barstate.islast
         => position.bottom_left
 
     var tbl = table.new(tbl_pos, 3, 15, border_width=1, border_color=color.new(color.gray, 70), bgcolor=color.new(#1a1a2e, 0))
-
-    f_light(int s) => s > 0 ? "🟢" : s < 0 ? "🔴" : "🟡"
 
     // ── Header
     table.cell(tbl, 0, 0, "METRIC", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
@@ -299,8 +302,6 @@ if show_dashboard and barstate.islast
     table.cell(tbl, 2, 11, "Δ", text_color=color.gray, text_size=size.tiny)
 
     // ── Strategy signals with delta recommendations
-    f_sig(int sig) => sig == 0 ? "GO" : sig == 1 ? "WAIT" : "STOP"
-    f_sig_col(int sig) => sig == 0 ? color.lime : sig == 1 ? color.yellow : color.red
 
     // 0DTE
     table.cell(tbl, 0, 12, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
