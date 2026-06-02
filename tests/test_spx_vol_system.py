@@ -18,8 +18,9 @@ class TestCalcZscore:
 
         history = np.array([15.0, 16.0, 17.0, 18.0, 19.0])
         z = SPXVolAnalyzer._calc_zscore(20.0, history)
-        # mean=17, std≈1.58, z≈(20-17)/1.58≈1.9
-        assert 1.8 < z < 2.0
+        # Pine-style: window=[16,17,18,19,20], mean=18, pop_std≈1.414
+        # z = (20-18)/1.414 ≈ 1.41
+        assert 1.3 < z < 1.5
 
     def test_empty_history(self):
         import numpy as np
@@ -38,9 +39,9 @@ class TestCalcExpectedMove:
         import math
 
         spx, vix, dte = 5200, 18.5, 7
-        em = spx * (vix / 100.0) / math.sqrt(252) * math.sqrt(max(dte, 1))
-        # 5200 * 0.185 / sqrt(252) * sqrt(7) ≈ 160
-        assert 155 < em < 165
+        em = spx * (vix / 100.0) * math.sqrt(max(dte, 1) / 365.0)
+        # 5200 * 0.185 * sqrt(7/365) ≈ 133
+        assert 130 < em < 140
 
 
 class TestCircuitBreaker:
@@ -71,14 +72,16 @@ class TestCircuitBreaker:
 
 class TestTermStructure:
     def test_states(self):
+        # ratio_weekly is VIX9D/VIX: < 1.0 = contango, > 1.0 = local backwardation
         ts = TermStructure(ratio_macro=0.92, ratio_weekly=0.98, ratio_intraday=1.10, slope_futures=1.06)
         assert ts.macro_state == "CONTANGO"
-        assert ts.weekly_state == "LOCAL BACKWARDATION"
+        assert ts.weekly_state == "CONTANGO"
         assert ts.intraday_state == "BACKWARDATION"
 
     def test_backwardation(self):
         ts = TermStructure(ratio_macro=1.05, ratio_weekly=1.05, ratio_intraday=0.9, slope_futures=0.93)
         assert ts.macro_state == "BACKWARDATION"
+        assert ts.weekly_state == "LOCAL BACKWARDATION"
         assert ts.intraday_state == "CONTANGO"
 
 

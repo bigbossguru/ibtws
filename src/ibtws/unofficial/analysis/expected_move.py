@@ -151,14 +151,14 @@ def _quote_mid(q: OptionQuote) -> float | None:
 
 
 def _straddle_expected_move(atm_call: OptionQuote | None, atm_put: OptionQuote | None) -> float | None:
-    """Expected move = ATM call mid + ATM put mid."""
+    """Expected move ≈ ATM straddle price × 0.85 (Black-Scholes 1σ correction)."""
     if atm_call is None or atm_put is None:
         return None
     call_mid = _quote_mid(atm_call)
     put_mid = _quote_mid(atm_put)
     if call_mid is None or put_mid is None:
         return None
-    return call_mid + put_mid
+    return (call_mid + put_mid) * 0.85
 
 
 def _extract_atm_iv(atm_call: OptionQuote | None, atm_put: OptionQuote | None) -> float | None:

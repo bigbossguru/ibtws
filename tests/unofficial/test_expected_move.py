@@ -86,7 +86,7 @@ class TestStraddleExpectedMove:
     def test_valid(self):
         call = _make_quote(550, "C", bid=5.0, ask=5.5)
         put = _make_quote(550, "P", bid=4.0, ask=4.5)
-        assert _straddle_expected_move(call, put) == 5.25 + 4.25
+        assert _straddle_expected_move(call, put) == (5.25 + 4.25) * 0.85
 
     def test_none_when_call_missing(self):
         assert _straddle_expected_move(None, _make_quote(550, "P", bid=4.0, ask=4.5)) is None
@@ -165,9 +165,9 @@ class TestExpectedMoveCalculator:
         assert result.spot == 550.0
         assert result.dte == 30.0
 
-        # Straddle: ATM call mid (5.25) + ATM put mid (4.25) = 9.5
-        assert result.straddle_move == 9.5
-        assert abs(result.straddle_pct - 9.5 / 550.0 * 100) < 1e-10
+        # Straddle: (ATM call mid (5.25) + ATM put mid (4.25)) × 0.85 = 8.075
+        assert result.straddle_move == pytest.approx((5.25 + 4.25) * 0.85)
+        assert abs(result.straddle_pct - result.straddle_move / 550.0 * 100) < 1e-10
 
         # IV: avg of 0.24 and 0.25 = 0.245
         expected_iv_move = 550.0 * 0.245 * math.sqrt(30.0 / 365.0)

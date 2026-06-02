@@ -41,7 +41,7 @@ _EST = _dt.timezone(_dt.timedelta(hours=-5))
 @dataclass(frozen=True)
 class TermStructure:
     ratio_macro: float  # VIX / VIX3M
-    ratio_weekly: float  # VIX / VIX9D
+    ratio_weekly: float  # VIX9D / VIX (short over long)
     ratio_intraday: float  # VIX1D / VIX
     slope_futures: float  # VIX_F2 / VIX_F1
 
@@ -51,7 +51,7 @@ class TermStructure:
 
     @property
     def weekly_state(self) -> str:
-        return "LOCAL BACKWARDATION" if self.ratio_weekly < 1.0 else "CONTANGO"
+        return "LOCAL BACKWARDATION" if self.ratio_weekly > 1.0 else "CONTANGO"
 
     @property
     def intraday_state(self) -> str:
@@ -134,6 +134,11 @@ class SPXVolAnalyzer:
         vvix, vvix_prev = await self._get_vvix()
         vix_f1, vix_f2 = await self._get_vx_futures()
 
+        # Previous day values for reversal detection
+        vix1d_prev = await self._get_prev_close(Index("VIX1D", "CBOE"))
+        vix9d_prev = await self._get_prev_close(Index("VIX9D", "CBOE"))
+        vix_prev = await self._get_prev_close(Index("VIX", "CBOE"))
+
         # Metric 1: VIX Z-Score (20-day)
         vix_history = await self._get_vix_history(20)
         vix_zscore = self._calc_zscore(vix, vix_history)
@@ -141,13 +146,20 @@ class SPXVolAnalyzer:
         # Metric 2: Expected Move (average of straddle, IV, and HV methods)
         em = await self._calc_expected_move(dte_weekly)
 
-        # Metric 3: Term Structure
+        # Metric 3: Term Structure (short-over-long ratios)
         ts = TermStructure(
             ratio_macro=vix / vix3m if vix3m > 0 else 1.0,
-            ratio_weekly=vix / vix9d if vix9d > 0 else 1.0,
+            ratio_weekly=vix9d / vix if vix > 0 else 1.0,
             ratio_intraday=vix1d / vix if vix > 0 else 1.0,
             slope_futures=vix_f2 / vix_f1 if vix_f1 > 0 else 1.0,
         )
+
+        # Reversal detection: current ratio declining from previous
+        prev_ratio_0dte = vix1d_prev / vix_prev if vix_prev > 0 else 1.0
+        ratio_0dte_reversing = ts.ratio_intraday < prev_ratio_0dte
+
+        prev_ratio_weekly = vix9d_prev / vix_prev if vix_prev > 0 else 1.0
+        ratio_weekly_reversing = ts.ratio_weekly < prev_ratio_weekly
 
         # Metric 4: VRP
         rv_20 = await self._calc_rv20()
@@ -162,8 +174,8 @@ class SPXVolAnalyzer:
         # Rules Engine
         circuit_breaker, cb_reasons = self._check_circuit_breaker(ts, vix_zscore)
 
-        signal_0dte = self._eval_0dte(ts, vvix_declining, vix1d, vix, spx, em)
-        signal_weekly = self._eval_weekly(vix_zscore, ts, vrp, spx, em)
+        signal_0dte = self._eval_0dte(ts, vvix_declining, ratio_0dte_reversing, spx, em)
+        signal_weekly = self._eval_weekly(vix_zscore, ts, vrp, ratio_weekly_reversing, spx, em)
         signal_monthly = self._eval_monthly(vix_zscore, ts, vrp, spx, em)
 
         if circuit_breaker:
@@ -197,10 +209,13 @@ class SPXVolAnalyzer:
 
     @staticmethod
     def _calc_zscore(current: float, history: np.ndarray) -> float:
+        # Match Pine Script behavior: include current value in the window
+        # This gives ta.sma/ta.stdev equivalent (in-sample Z-score)
         if len(history) < 2:
             return 0.0
-        mu = float(np.mean(history))
-        sigma = float(np.std(history, ddof=1))
+        window = np.append(history, current)[-len(history) :]
+        mu = float(np.mean(window))
+        sigma = float(np.std(window, ddof=0))  # Pine uses population std (ddof=0)
         if sigma == 0:
             return 0.0
         return (current - mu) / sigma
@@ -225,10 +240,11 @@ class SPXVolAnalyzer:
                 return sum(values) / len(values)
         except Exception as e:
             logger.warning("SPXVol: ExpectedMoveCalculator failed: %s", e)
-        # Fallback formula
+        # Fallback formula: Price × (VIX/100) × √(DTE/365)
+        # VIX is annualized over calendar days (365), not trading days (252)
         spx = await self._get_price(Index("SPX", "CBOE"))
         vix = await self._get_price(Index("VIX", "CBOE"))
-        return spx * (vix / 100.0) / math.sqrt(252) * math.sqrt(max(dte, 1))
+        return spx * (vix / 100.0) * math.sqrt(max(dte, 1) / 365.0)
 
     async def _calc_rv20(self) -> float:
         """20-day annualized realized volatility of SPX (as %)."""
@@ -297,7 +313,7 @@ class SPXVolAnalyzer:
         return len(reasons) > 0, reasons
 
     def _eval_0dte(
-        self, ts: TermStructure, vvix_declining: bool, vix1d: float, vix: float, spx: float, em: float
+        self, ts: TermStructure, vvix_declining: bool, ratio_reversing: bool, spx: float, em: float
     ) -> StrategySignal:
         now = _dt.datetime.now(tz=_EST)
         market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -306,30 +322,33 @@ class SPXVolAnalyzer:
         if min_after_open < 20:
             return StrategySignal("YELLOW", "Wait — less than 20 min after open")
 
-        ratio = vix1d / vix if vix > 0 else 1.0
-        if ratio > 1.25 and vvix_declining:
+        ratio = ts.ratio_intraday
+        if ratio > 1.25 and ratio_reversing and vvix_declining:
             strike = spx - 1.5 * em
-            return StrategySignal("GREEN", f"VIX1D/VIX={ratio:.2f} reversal + VVIX declining", round(strike))
+            return StrategySignal("GREEN", f"VIX1D/VIX={ratio:.2f} reversal confirmed + VVIX declining", round(strike))
+
+        if ratio > 1.25 and not ratio_reversing:
+            return StrategySignal("YELLOW", f"VIX1D/VIX={ratio:.2f} spiking but no reversal yet")
 
         if ratio > 1.10:
-            return StrategySignal("YELLOW", f"VIX1D/VIX={ratio:.2f} elevated, waiting for reversal")
+            return StrategySignal("YELLOW", f"VIX1D/VIX={ratio:.2f} elevated, waiting for spike >1.25")
 
         return StrategySignal("YELLOW", "No intraday panic spike detected")
 
-    def _eval_weekly(self, zscore: float, ts: TermStructure, vrp: float, spx: float, em: float) -> StrategySignal:
-        conditions_met = zscore > 1.5 and ts.ratio_weekly < 0.90 and vrp > 0
-        if conditions_met:
-            # 10-12 delta ~ roughly 2x EM distance
+    def _eval_weekly(
+        self, zscore: float, ts: TermStructure, vrp: float, ratio_reversing: bool, spx: float, em: float
+    ) -> StrategySignal:
+        # VIX9D/VIX > 1.15 with downward reversal + VRP > 0
+        ratio = ts.ratio_weekly
+        if ratio > 1.15 and ratio_reversing and vrp > 0:
             strike = spx - 2.0 * em
-            return StrategySignal(
-                "GREEN", f"Z={zscore:.2f}, VIX/VIX9D={ts.ratio_weekly:.2f}, VRP={vrp:.1f}", round(strike)
-            )
+            return StrategySignal("GREEN", f"VIX9D/VIX={ratio:.2f} reversal, VRP={vrp:.1f}", round(strike))
 
         reasons = []
-        if zscore <= 1.5:
-            reasons.append(f"Z-Score={zscore:.2f} (need >1.5)")
-        if ts.ratio_weekly >= 0.90:
-            reasons.append(f"VIX/VIX9D={ts.ratio_weekly:.2f} (need <0.90)")
+        if ratio <= 1.15:
+            reasons.append(f"VIX9D/VIX={ratio:.2f} (need >1.15 spike)")
+        elif not ratio_reversing:
+            reasons.append(f"VIX9D/VIX={ratio:.2f} still rising (need reversal)")
         if vrp <= 0:
             reasons.append(f"VRP={vrp:.1f} (need >0)")
         return StrategySignal("YELLOW", "; ".join(reasons))
@@ -372,6 +391,18 @@ class SPXVolAnalyzer:
         except Exception as e:
             logger.warning("SPXVol: historical fallback failed for %s: %s", contract.symbol, e)
         return 0.0
+
+    async def _get_prev_close(self, contract: Contract) -> float:
+        """Return previous day's closing value for reversal detection."""
+        try:
+            df = await self._client.get_historical_data(
+                contract, duration="5 D", bar_size="1 day", what_to_show="TRADES", use_rth=True
+            )
+            if df is not None and len(df) >= 2:
+                return float(df["close"].iloc[-2])
+        except Exception as e:
+            logger.warning("SPXVol: prev close failed for %s: %s", contract.symbol, e)
+        return await self._get_price(contract)
 
     async def _get_vvix(self) -> tuple[float, float]:
         """Return (current, prev_close)."""
@@ -452,7 +483,7 @@ def format_report(r: SPXVolReport) -> str:
         "[TERM STRUCTURE]",
         f"F2/F1 Spread: {ts.slope_futures:.2f} ({ts.intraday_state})",
         f"VIX/VIX3M:    {ts.ratio_macro:.2f} ({ts.macro_state})",
-        f"VIX/VIX9D:    {ts.ratio_weekly:.2f} ({ts.weekly_state})",
+        f"VIX9D/VIX:    {ts.ratio_weekly:.2f} ({ts.weekly_state})",
         "",
         "[STRATEGY EVALUATION]",
         f"-> 0DTE Strategy:   [{r.signal_0dte.signal}] ({r.signal_0dte.reason})",
