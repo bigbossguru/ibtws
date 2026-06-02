@@ -157,9 +157,11 @@ delta_weekly  = signal_weekly == 0 ? 12 : signal_weekly == 1 ? 8 : 0
 delta_monthly = signal_monthly == 0 ? 10 : signal_monthly == 1 ? 7 : 0
 
 // ─── EXPECTED MOVE (tenor-matched, skew-adjusted) ────────────────────────────
-// Uses correct implied vol per tenor: VIX1D→0DTE, VIX9D→weekly, VIX→monthly
-// Skew adjustment: downside EM is wider by skew factor (puts are more expensive)
-// Calendar-day scaling: √(DTE/365) for proper annualization
+// Professional EM formula: Price × (IV/100) × √(DTE/365)
+// Key distinction per CBOE methodology:
+//   - VIX1D uses business days (252/yr) — it's annualized over trading days
+//   - VIX, VIX9D, VIX3M use calendar days (365/yr) — annualized over calendar days
+// Skew adjustment: downside EM wider by SKEW-derived factor (puts are more expensive)
 
 var float open_price = na
 is_new_session = session.isfirstbar
@@ -168,15 +170,15 @@ if is_new_session
 
 // Skew factor: SKEW index encodes tail risk; convert to downside multiplier
 // SKEW=100 → symmetric; SKEW=130 → ~10% fatter left tail
-skew_down_mult = 1.0 + (skew - 100.0) / 300.0  // e.g. SKEW=130 → 1.10
+skew_down_mult = 1.0 + (skew - 100.0) / 300.0
 
-// Tenor-matched EM: each timeframe uses its own implied vol index
-// VIX1D is already a 1-day vol → annualized, so: Price × (VIX1D/100) × √(1/365)
-// VIX9D is 9-day annualized → Price × (VIX9D/100) × √(DTE/365)
-// VIX is 30-day annualized → Price × (VIX/100) × √(DTE/365)
-em_1d = nz(open_price) * (vix1d / 100.0) * math.sqrt(1.0 / 365.0)
+// Tenor-matched EM calculation:
+// VIX1D: annualized over business days → de-annualize with √(1/252)
+// VIX9D: annualized over calendar days → de-annualize with √(DTE/365)
+// VIX:   annualized over calendar days → de-annualize with √(DTE/365)
+em_1d = nz(open_price) * (vix1d / 100.0) * math.sqrt(1.0 / 252.0)
 em_w  = nz(open_price) * (vix9d / 100.0) * math.sqrt(dte_weekly / 365.0)
-em_m  = nz(open_price) * (vix  / 100.0)  * math.sqrt(dte_monthly / 365.0)
+em_m  = nz(open_price) * (vix   / 100.0) * math.sqrt(dte_monthly / 365.0)
 
 // ─── STRIKE LEVELS (skew-adjusted downside) ──────────────────────────────────
 mult_0dte   = signal_0dte == 0 ? 1.5 : 2.0
