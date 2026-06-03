@@ -1,7 +1,8 @@
-// SPX Volatility Traffic Light System for Options Premium Selling
+// SPX Volatility Traffic Light System + Markov Regime
 // Full 9-metric rule engine with Put Credit Spread / BWB strategy signals
+// Markov regime (Bull/Bear/Sideways) integrated as market context filter
 //@version=5
-indicator("SPX Vol Traffic Light", overlay=true, max_lines_count=500, max_labels_count=50)
+indicator("SPX Vol Traffic Light + Markov", overlay=true, max_lines_count=500, max_labels_count=500)
 
 // ─── INPUTS ──────────────────────────────────────────────────────────────────
 grp_data = "Data Sources"
@@ -21,11 +22,22 @@ bbw_mult     = input.float(2.0, "BBW StdDev Mult",     minval=1.0, group=grp_par
 dte_weekly   = input.int(7,   "Weekly DTE",             minval=1,  group=grp_params)
 dte_monthly  = input.int(30,  "Monthly DTE",            minval=14, group=grp_params)
 
+grp_markov = "Markov Regime"
+mkv_lookback       = input.int(20,   "Lookback (bars)",       minval=5, maxval=250, group=grp_markov)
+mkv_bull_thresh    = input.float(5.0, "Bull threshold (%)",   minval=0.1, step=0.1, group=grp_markov)
+mkv_bear_thresh    = input.float(5.0, "Bear threshold (%)",   minval=0.1, step=0.1, group=grp_markov)
+mkv_stationary_pow = input.int(50,   "Stationary iterations", minval=10, maxval=200, group=grp_markov)
+mkv_min_hold       = input.int(4,    "Min bars for label",    minval=1,  maxval=50, group=grp_markov)
+
 grp_display = "Display"
-show_em_bands  = input.bool(true, "Expected Move Bands", group=grp_display)
-show_strikes   = input.bool(true, "Recommended Strikes", group=grp_display)
-show_dashboard = input.bool(true, "Dashboard Panel",     group=grp_display)
-dash_pos       = input.string("Bottom Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_display)
+show_em_bands      = input.bool(true,  "Expected Move Bands",    group=grp_display)
+show_strikes       = input.bool(true,  "Recommended Strikes",    group=grp_display)
+show_dashboard     = input.bool(true,  "Dashboard Panel",        group=grp_display)
+show_regime_ribbon = input.bool(true,  "Markov Regime Ribbon",   group=grp_display)
+show_regime_labels = input.bool(true,  "Regime Transition Labels", group=grp_display)
+show_matrix_table  = input.bool(false, "Transition Matrix Table", group=grp_display)
+dash_pos           = input.string("Bottom Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_display)
+matrix_pos_input   = input.string("Top Right", "Matrix Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grp_display)
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
 vix    = request.security(vix_sym,   timeframe.period, close)
@@ -38,8 +50,40 @@ skew   = request.security(skew_sym,  timeframe.period, close)
 
 spx = close
 
+// ─── MARKOV REGIME ───────────────────────────────────────────────────────────
+// regime: 0 = Sideways, 1 = Bull, 2 = Bear
+mkv_log_ret = math.log(close / close[mkv_lookback])
+regime = na(mkv_log_ret) ? int(na) : mkv_log_ret > mkv_bull_thresh / 100.0 ? 1 : mkv_log_ret < -mkv_bear_thresh / 100.0 ? 2 : 0
+
+// Transition counting
+var mkv_counts = array.new_int(9, 0)
+mkv_prev = regime[1]
+if barstate.isconfirmed and not na(mkv_prev) and not na(regime)
+    mkv_idx = mkv_prev * 3 + regime
+    array.set(mkv_counts, mkv_idx, array.get(mkv_counts, mkv_idx) + 1)
+
+// Regime persistence (for labels)
+var int mkv_last_lbl_regime = na
+mkv_held = not na(regime)
+for k = 0 to mkv_min_hold - 1
+    mkv_held := mkv_held and not na(regime[k]) and regime[k] == regime
+
+if barstate.isconfirmed and not na(regime) and mkv_held and regime != mkv_last_lbl_regime
+    if show_regime_labels and not na(mkv_last_lbl_regime)
+        flip_off = mkv_min_hold - 1
+        lbl_name = (mkv_last_lbl_regime == 1 ? "BULL" : mkv_last_lbl_regime == 2 ? "BEAR" : "SIDE") + " → " + (regime == 1 ? "BULL" : regime == 2 ? "BEAR" : "SIDE")
+        lbl_col = regime == 1 ? color.rgb(132, 187, 161, 30) : regime == 2 ? color.rgb(197, 127, 134, 30) : color.rgb(164, 171, 183, 30)
+        label.new(bar_index - flip_off, high[flip_off], lbl_name, yloc=yloc.abovebar, style=label.style_label_down, color=lbl_col, textcolor=color.white, size=size.normal)
+    mkv_last_lbl_regime := regime
+
+// Regime ribbon
+mkv_ribbon = regime == 1 ? color.rgb(132, 187, 161, 92) : regime == 2 ? color.rgb(197, 127, 134, 92) : color.rgb(164, 171, 183, 94)
+bgcolor(show_regime_ribbon ? mkv_ribbon : na, title="Regime Ribbon")
+
+// Regime as signal filter: Bear = headwind for put selling
+regime_bear = regime == 2
+
 // ─── METRIC 1: VIX Z-SCORE (20d) ────────────────────────────────────────────
-// GREEN: > +1.5 with downward reversal | RED: < -2.0
 vix_sma    = ta.sma(vix, zscore_len)
 vix_stdev  = ta.stdev(vix, zscore_len)
 vix_zscore = vix_stdev != 0 ? (vix - vix_sma) / vix_stdev : 0.0
@@ -49,7 +93,6 @@ zscore_green = vix_zscore > 1.5 and vix_reversing_down
 zscore_red   = vix_zscore < -2.0
 
 // ─── METRIC 2: VRP (VIX - RV20) ─────────────────────────────────────────────
-// GREEN: > +2.0% | RED: <= 0%
 log_ret = math.log(close / close[1])
 rv_20   = ta.stdev(log_ret, rv_len) * math.sqrt(252) * 100
 vrp     = vix - rv_20
@@ -58,7 +101,6 @@ vrp_green = vrp > 2.0
 vrp_red   = vrp <= 0.0
 
 // ─── METRIC 3: VIX1D/VIX (0DTE Ratio) ───────────────────────────────────────
-// GREEN: spike > 1.25 with downward reversal | RED: vertical spike > 1.0 rising
 ratio_0dte = vix != 0 ? vix1d / vix : 1.0
 ratio_0dte_reversing = ratio_0dte < ratio_0dte[1] and ratio_0dte[1] > ratio_0dte[2]
 
@@ -66,7 +108,6 @@ r0dte_green = ratio_0dte > 1.25 and ratio_0dte_reversing
 r0dte_red   = ratio_0dte > 1.0 and ratio_0dte > ratio_0dte[1]
 
 // ─── METRIC 4: VIX9D/VIX (Weekly Ratio) ─────────────────────────────────────
-// GREEN: spike > 1.15 with downward reversal | RED: rally > 1.10 rising
 ratio_weekly = vix != 0 ? vix9d / vix : 1.0
 ratio_weekly_reversing = ratio_weekly < ratio_weekly[1] and ratio_weekly[1] > ratio_weekly[2]
 
@@ -74,7 +115,6 @@ rweekly_green = ratio_weekly > 1.15 and ratio_weekly_reversing
 rweekly_red   = ratio_weekly > 1.10 and ratio_weekly > ratio_weekly[1]
 
 // ─── METRIC 5: VIX/VIX3M (Macro Term Structure) ─────────────────────────────
-// GREEN: < 1.0 (contango) | RED: > 1.15 and rising (systemic)
 ratio_macro = vix3m != 0 ? vix / vix3m : 1.0
 macro_rising = ratio_macro > ratio_macro[1] and ratio_macro[1] > ratio_macro[2]
 
@@ -82,7 +122,6 @@ macro_green = ratio_macro < 1.0
 macro_red   = ratio_macro > 1.15 and macro_rising
 
 // ─── METRIC 6: VVIX ─────────────────────────────────────────────────────────
-// GREEN: declining while VIX elevated | RED: spike > 115 while VIX calm
 vvix_declining = vvix < vvix[1] and vvix[1] < vvix[2]
 vix_elevated   = vix_zscore > 1.0
 
@@ -90,8 +129,6 @@ vvix_green = vvix_declining and vix_elevated
 vvix_red   = vvix > 115 and vix_zscore < 0.5
 
 // ─── METRIC 7: SKEW SLOPE RATIO ─────────────────────────────────────────────
-// GREEN: > 1.0 (OTM puts overpriced) | RED: below norm (flat slope)
-// Using SKEW/100 as proxy: SKEW typically 100-170, normalized to ratio
 skew_ratio = skew / 100.0
 skew_sma   = ta.sma(skew_ratio, zscore_len)
 
@@ -99,12 +136,10 @@ skew_green = skew_ratio > 1.0
 skew_red   = skew_ratio < skew_sma * 0.95
 
 // ─── METRIC 8: COR1M (Implied Correlation) ──────────────────────────────────
-// GREEN: < 30 (local correction) | RED: > 65 (panic sell-off)
 cor1m_green = cor1m < 30
 cor1m_red   = cor1m > 65
 
 // ─── METRIC 9: BBW on SPX (Bollinger Band Width) ────────────────────────────
-// GREEN: average/expanding | RED: multi-month minimum (coiled spring)
 bb_basis = ta.sma(spx, bbw_len)
 bb_upper = bb_basis + bbw_mult * ta.stdev(spx, bbw_len)
 bb_lower = bb_basis - bbw_mult * ta.stdev(spx, bbw_len)
@@ -115,7 +150,6 @@ bbw_green = bbw > bbw_min_60 * 1.1
 bbw_red   = bbw <= bbw_min_60 * 1.02
 
 // ─── COMPOSITE SCORING ───────────────────────────────────────────────────────
-// Score: GREEN = +1, neutral = 0, RED = -1
 f_score(bool g, bool r) => g ? 1 : r ? -1 : 0
 
 score_zscore  = f_score(zscore_green, zscore_red)
@@ -131,65 +165,58 @@ score_bbw     = f_score(bbw_green, bbw_red)
 // ─── CIRCUIT BREAKER (any critical RED = HALT) ───────────────────────────────
 circuit_breaker = macro_red or zscore_red or cor1m_red
 
-// ─── STRATEGY SIGNALS ────────────────────────────────────────────────────────
-// 0DTE: needs 0dte ratio GREEN + VRP not RED + no circuit breaker
-green_0dte = r0dte_green and vrp_green and macro_green and not circuit_breaker
+// ─── STRATEGY SIGNALS (regime-aware) ─────────────────────────────────────────
+// Bear regime adds headwind: blocks GREEN, forces wider strikes
+
+// 0DTE
+green_0dte = r0dte_green and vrp_green and macro_green and not circuit_breaker and not regime_bear
 yellow_0dte = not green_0dte and not circuit_breaker and not r0dte_red and vrp > 0
 signal_0dte = circuit_breaker ? 2 : green_0dte ? 0 : yellow_0dte ? 1 : 2
 
-// Weekly (7 DTE): needs weekly ratio signal + VRP + contango
-green_weekly = (rweekly_green or zscore_green) and vrp_green and macro_green and not bbw_red and not circuit_breaker
+// Weekly (7 DTE)
+green_weekly = (rweekly_green or zscore_green) and vrp_green and macro_green and not bbw_red and not circuit_breaker and not regime_bear
 yellow_weekly = not green_weekly and not circuit_breaker and vrp > 0 and ratio_macro < 1.05
 signal_weekly = circuit_breaker ? 2 : green_weekly ? 0 : yellow_weekly ? 1 : 2
 
-// Monthly (21-45 DTE): full picture — most metrics must align
+// Monthly (21-45 DTE)
 total_pos = (score_zscore > 0 ? 1 : 0) + (score_vrp > 0 ? 1 : 0) + (score_macro > 0 ? 1 : 0) + (score_vvix > 0 ? 1 : 0) + (score_skew > 0 ? 1 : 0) + (score_cor1m > 0 ? 1 : 0) + (score_bbw > 0 ? 1 : 0)
 total_neg = (score_zscore < 0 ? 1 : 0) + (score_vrp < 0 ? 1 : 0) + (score_macro < 0 ? 1 : 0) + (score_vvix < 0 ? 1 : 0) + (score_skew < 0 ? 1 : 0) + (score_cor1m < 0 ? 1 : 0) + (score_bbw < 0 ? 1 : 0)
 
-green_monthly = total_pos >= 5 and total_neg == 0 and not circuit_breaker
+green_monthly = total_pos >= 5 and total_neg == 0 and not circuit_breaker and not regime_bear
 yellow_monthly = not green_monthly and not circuit_breaker and total_neg <= 1 and vrp > 0
 signal_monthly = circuit_breaker ? 2 : green_monthly ? 0 : yellow_monthly ? 1 : 2
 
 // ─── DELTA / DISTANCE RECOMMENDATION ────────────────────────────────────────
-// GREEN: 10-12 delta (~1.5 EM) | YELLOW: 8 delta (~2.0 EM) | RED: no trade
-delta_0dte    = signal_0dte == 0 ? 12 : signal_0dte == 1 ? 8 : 0
-delta_weekly  = signal_weekly == 0 ? 12 : signal_weekly == 1 ? 8 : 0
-delta_monthly = signal_monthly == 0 ? 10 : signal_monthly == 1 ? 7 : 0
+// Bear regime: widen strikes by 2 delta even on YELLOW
+delta_adj = regime_bear ? -2 : 0
+delta_0dte    = signal_0dte == 0 ? 12 + delta_adj : signal_0dte == 1 ? 8 + delta_adj : 0
+delta_weekly  = signal_weekly == 0 ? 12 + delta_adj : signal_weekly == 1 ? 8 + delta_adj : 0
+delta_monthly = signal_monthly == 0 ? 10 + delta_adj : signal_monthly == 1 ? 7 + delta_adj : 0
 
 // ─── EXPECTED MOVE (tenor-matched, skew-adjusted) ────────────────────────────
-// Professional EM formula: Price × (IV/100) × √(DTE/365)
-// Key distinction per CBOE methodology:
-//   - VIX1D uses business days (252/yr) — it's annualized over trading days
-//   - VIX, VIX9D, VIX3M use calendar days (365/yr) — annualized over calendar days
-// Skew adjustment: downside EM wider by SKEW-derived factor (puts are more expensive)
-
 var float open_price = na
 is_new_session = session.isfirstbar
 if is_new_session
     open_price := open
 
-// Skew factor: SKEW index encodes tail risk; convert to downside multiplier
-// SKEW=100 → symmetric; SKEW=130 → ~10% fatter left tail
 skew_down_mult = 1.0 + (skew - 100.0) / 300.0
 
-// Tenor-matched EM calculation:
-// VIX1D: annualized over business days → de-annualize with √(1/252)
-// VIX9D: annualized over calendar days → de-annualize with √(DTE/365)
-// VIX:   annualized over calendar days → de-annualize with √(DTE/365)
 em_1d = nz(open_price) * (vix1d / 100.0) * math.sqrt(1.0 / 252.0)
 em_w  = nz(open_price) * (vix9d / 100.0) * math.sqrt(dte_weekly / 365.0)
 em_m  = nz(open_price) * (vix   / 100.0) * math.sqrt(dte_monthly / 365.0)
 
-// ─── STRIKE LEVELS (skew-adjusted downside) ──────────────────────────────────
-mult_0dte   = signal_0dte == 0 ? 1.5 : 2.0
-mult_weekly = signal_weekly == 0 ? 1.5 : 2.0
-mult_monthly = signal_monthly == 0 ? 2.0 : 2.5
+// ─── STRIKE LEVELS (skew-adjusted, regime-aware) ─────────────────────────────
+// Bear regime: widen multiplier by 0.5
+regime_mult_adj = regime_bear ? 0.5 : 0.0
+mult_0dte   = (signal_0dte == 0 ? 1.5 : 2.0) + regime_mult_adj
+mult_weekly = (signal_weekly == 0 ? 1.5 : 2.0) + regime_mult_adj
+mult_monthly = (signal_monthly == 0 ? 2.0 : 2.5) + regime_mult_adj
 
 strike_0dte    = nz(open_price) - mult_0dte * em_1d * skew_down_mult
 strike_weekly  = nz(open_price) - mult_weekly * em_w * skew_down_mult
 strike_monthly = nz(open_price) - mult_monthly * em_m * skew_down_mult
 
-// ─── EXPECTED MOVE BANDS (asymmetric: downside wider than upside) ────────────
+// ─── EXPECTED MOVE BANDS (asymmetric) ────────────────────────────────────────
 em_up_0 = nz(open_price) + em_1d
 em_dn_0 = nz(open_price) - em_1d * skew_down_mult
 em_up_w = nz(open_price) + em_w
@@ -224,7 +251,7 @@ plotshape(signal_weekly == 0 and signal_weekly[1] != 0, "Weekly GO", style=shape
 plotshape(signal_monthly == 0 and signal_monthly[1] != 0, "Monthly GO", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.small, text="MO")
 plotshape(circuit_breaker and not circuit_breaker[1], "CB ON", style=shape.xcross, location=location.abovebar, color=color.red, size=size.normal, text="HALT")
 
-// ─── BACKGROUND & BAR COLOR ──────────────────────────────────────────────────
+// ─── BACKGROUND (circuit breaker overrides regime ribbon) ────────────────────
 bgcolor(circuit_breaker ? color.new(color.red, 93) : na, title="Circuit Breaker BG")
 barcolor(circuit_breaker ? color.new(color.red, 40) : vix_zscore > 2.0 ? color.new(color.orange, 40) : na, title="Regime Bar Color")
 
@@ -232,6 +259,21 @@ barcolor(circuit_breaker ? color.new(color.red, 40) : vix_zscore > 2.0 ? color.n
 f_light(int s) => s > 0 ? "🟢" : s < 0 ? "🔴" : "🟡"
 f_sig(int sig) => sig == 0 ? "GO" : sig == 1 ? "WAIT" : "STOP"
 f_sig_col(int sig) => sig == 0 ? color.lime : sig == 1 ? color.yellow : color.red
+f_regime_name(int r) => r == 1 ? "BULL" : r == 2 ? "BEAR" : "SIDE"
+f_regime_col(int r) => r == 1 ? color.rgb(132, 187, 161) : r == 2 ? color.rgb(197, 127, 134) : color.rgb(164, 171, 183)
+
+// ─── MARKOV MATRIX MATH ─────────────────────────────────────────────────────
+matmul_3x3(float[] A, float[] B) =>
+    C = array.new_float(9, 0.0)
+    for r = 0 to 2
+        for c = 0 to 2
+            array.set(C, r * 3 + c, array.get(A, r * 3 + 0) * array.get(B, 0 * 3 + c) + array.get(A, r * 3 + 1) * array.get(B, 1 * 3 + c) + array.get(A, r * 3 + 2) * array.get(B, 2 * 3 + c))
+    C
+
+fmt_pct(float p) => str.tostring(math.round(p * 100)) + "%"
+
+// Display order: Bull(0) Bear(1) Side(2) → internal: 1, 2, 0
+disp_to_internal(int d) => d == 0 ? 1 : d == 1 ? 2 : 0
 
 // ─── DASHBOARD ───────────────────────────────────────────────────────────────
 if show_dashboard and barstate.islast
@@ -241,84 +283,145 @@ if show_dashboard and barstate.islast
         "Bottom Right" => position.bottom_right
         => position.bottom_left
 
-    var tbl = table.new(tbl_pos, 3, 15, border_width=1, border_color=color.new(color.gray, 70), bgcolor=color.new(#1a1a2e, 0))
+    var tbl = table.new(tbl_pos, 3, 17, border_width=1, border_color=color.new(color.gray, 70), bgcolor=color.new(#1a1a2e, 0))
 
     // ── Header
     table.cell(tbl, 0, 0, "METRIC", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
     table.cell(tbl, 1, 0, "VALUE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_right)
     table.cell(tbl, 2, 0, "", text_size=size.tiny)
 
-    // ── Row 1: VIX Z-Score
-    table.cell(tbl, 0, 1, "VIX Z", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 1, str.tostring(vix, "#.#") + " Z:" + str.tostring(vix_zscore, "+#.##"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 1, f_light(score_zscore), text_size=size.tiny)
+    // ── Row 1: Markov Regime
+    table.cell(tbl, 0, 1, "REGIME", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, f_regime_name(regime), text_color=f_regime_col(regime), text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 1, regime == 1 ? "🟢" : regime == 2 ? "🔴" : "🟡", text_size=size.tiny)
 
-    // ── Row 2: VRP
-    table.cell(tbl, 0, 2, "VRP", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 2, str.tostring(vrp, "+#.#") + "%", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 2, f_light(score_vrp), text_size=size.tiny)
+    // ── Row 2: VIX Z-Score
+    table.cell(tbl, 0, 2, "VIX Z", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, str.tostring(vix, "#.#") + " Z:" + str.tostring(vix_zscore, "+#.##"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 2, f_light(score_zscore), text_size=size.tiny)
 
-    // ── Row 3: VIX1D/VIX
-    table.cell(tbl, 0, 3, "1D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 3, str.tostring(ratio_0dte, "#.##"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 3, f_light(score_0dte), text_size=size.tiny)
+    // ── Row 3: VRP
+    table.cell(tbl, 0, 3, "VRP", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(vrp, "+#.#") + "%", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 3, f_light(score_vrp), text_size=size.tiny)
 
-    // ── Row 4: VIX9D/VIX
-    table.cell(tbl, 0, 4, "9D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 4, str.tostring(ratio_weekly, "#.##"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 4, f_light(score_weekly), text_size=size.tiny)
+    // ── Row 4: VIX1D/VIX
+    table.cell(tbl, 0, 4, "1D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, str.tostring(ratio_0dte, "#.##"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 4, f_light(score_0dte), text_size=size.tiny)
 
-    // ── Row 5: VIX/VIX3M
-    table.cell(tbl, 0, 5, "VIX/3M", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 5, str.tostring(ratio_macro, "#.##") + (ratio_macro < 1.0 ? " CT" : " BW"), text_color=ratio_macro < 1.0 ? color.green : color.red, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 5, f_light(score_macro), text_size=size.tiny)
+    // ── Row 5: VIX9D/VIX
+    table.cell(tbl, 0, 5, "9D/VIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, str.tostring(ratio_weekly, "#.##"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 5, f_light(score_weekly), text_size=size.tiny)
 
-    // ── Row 6: VVIX
-    table.cell(tbl, 0, 6, "VVIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 6, str.tostring(vvix, "#.#") + (vvix_declining ? " ↓" : " ↑"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 6, f_light(score_vvix), text_size=size.tiny)
+    // ── Row 6: VIX/VIX3M
+    table.cell(tbl, 0, 6, "VIX/3M", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, str.tostring(ratio_macro, "#.##") + (ratio_macro < 1.0 ? " CT" : " BW"), text_color=ratio_macro < 1.0 ? color.green : color.red, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 6, f_light(score_macro), text_size=size.tiny)
 
-    // ── Row 7: Skew
-    table.cell(tbl, 0, 7, "SKEW", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 7, str.tostring(skew, "#.#") + " (" + str.tostring(skew_ratio, "#.##") + ")", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 7, f_light(score_skew), text_size=size.tiny)
+    // ── Row 7: VVIX
+    table.cell(tbl, 0, 7, "VVIX", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, str.tostring(vvix, "#.#") + (vvix_declining ? " ↓" : " ↑"), text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 7, f_light(score_vvix), text_size=size.tiny)
 
-    // ── Row 8: COR1M
-    table.cell(tbl, 0, 8, "COR1M", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 8, str.tostring(cor1m, "#.#"), text_color=cor1m < 30 ? color.green : cor1m > 65 ? color.red : color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 8, f_light(score_cor1m), text_size=size.tiny)
+    // ── Row 8: Skew
+    table.cell(tbl, 0, 8, "SKEW", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, str.tostring(skew, "#.#") + " (" + str.tostring(skew_ratio, "#.##") + ")", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 8, f_light(score_skew), text_size=size.tiny)
 
-    // ── Row 9: BBW
-    table.cell(tbl, 0, 9, "BBW", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 9, str.tostring(bbw, "#.##") + "%", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 9, f_light(score_bbw), text_size=size.tiny)
+    // ── Row 9: COR1M
+    table.cell(tbl, 0, 9, "COR1M", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 9, str.tostring(cor1m, "#.#"), text_color=cor1m < 30 ? color.green : cor1m > 65 ? color.red : color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 9, f_light(score_cor1m), text_size=size.tiny)
 
-    // ── Row 10: EM (show downside which is wider due to skew)
-    table.cell(tbl, 0, 10, "EM↓", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 10, str.tostring(em_1d * skew_down_mult, "#") + "d " + str.tostring(em_w * skew_down_mult, "#") + "w " + str.tostring(em_m * skew_down_mult, "#") + "m", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 10, "×" + str.tostring(skew_down_mult, "#.##"), text_color=color.gray, text_size=size.tiny)
+    // ── Row 10: BBW
+    table.cell(tbl, 0, 10, "BBW", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 10, str.tostring(bbw, "#.##") + "%", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 10, f_light(score_bbw), text_size=size.tiny)
+
+    // ── Row 11: EM
+    table.cell(tbl, 0, 11, "EM↓", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 11, str.tostring(em_1d * skew_down_mult, "#") + "d " + str.tostring(em_w * skew_down_mult, "#") + "w " + str.tostring(em_m * skew_down_mult, "#") + "m", text_color=color.white, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 11, "×" + str.tostring(skew_down_mult, "#.##"), text_color=color.gray, text_size=size.tiny)
 
     // ── Separator
-    table.cell(tbl, 0, 11, "─────", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 11, "SIGNAL", text_color=color.gray, text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 11, "Δ", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 0, 12, "─────", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 12, "SIGNAL", text_color=color.gray, text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 12, "Δ", text_color=color.gray, text_size=size.tiny)
 
-    // ── Strategy signals with delta recommendations
+    // ── Strategy signals
+    table.cell(tbl, 0, 13, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 13, f_sig(signal_0dte) + (signal_0dte != 2 ? " <" + str.tostring(strike_0dte, "#") : ""), text_color=f_sig_col(signal_0dte), text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 13, signal_0dte != 2 ? str.tostring(delta_0dte) + "Δ" : "—", text_color=f_sig_col(signal_0dte), text_size=size.tiny)
 
-    // 0DTE
-    table.cell(tbl, 0, 12, "0DTE", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 12, f_sig(signal_0dte) + (signal_0dte != 2 ? " <" + str.tostring(strike_0dte, "#") : ""), text_color=f_sig_col(signal_0dte), text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 12, signal_0dte != 2 ? str.tostring(delta_0dte) + "Δ" : "—", text_color=f_sig_col(signal_0dte), text_size=size.tiny)
+    table.cell(tbl, 0, 14, "WEEKLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 14, f_sig(signal_weekly) + (signal_weekly != 2 ? " <" + str.tostring(strike_weekly, "#") : ""), text_color=f_sig_col(signal_weekly), text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 14, signal_weekly != 2 ? str.tostring(delta_weekly) + "Δ" : "—", text_color=f_sig_col(signal_weekly), text_size=size.tiny)
 
-    // Weekly
-    table.cell(tbl, 0, 13, "WEEKLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 13, f_sig(signal_weekly) + (signal_weekly != 2 ? " <" + str.tostring(strike_weekly, "#") : ""), text_color=f_sig_col(signal_weekly), text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 13, signal_weekly != 2 ? str.tostring(delta_weekly) + "Δ" : "—", text_color=f_sig_col(signal_weekly), text_size=size.tiny)
+    table.cell(tbl, 0, 15, "MONTHLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 15, f_sig(signal_monthly) + (signal_monthly != 2 ? " <" + str.tostring(strike_monthly, "#") : ""), text_color=f_sig_col(signal_monthly), text_size=size.tiny, text_halign=text.align_right)
+    table.cell(tbl, 2, 15, signal_monthly != 2 ? str.tostring(delta_monthly) + "Δ" : "—", text_color=f_sig_col(signal_monthly), text_size=size.tiny)
 
-    // Monthly
-    table.cell(tbl, 0, 14, "MONTHLY", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
-    table.cell(tbl, 1, 14, f_sig(signal_monthly) + (signal_monthly != 2 ? " <" + str.tostring(strike_monthly, "#") : ""), text_color=f_sig_col(signal_monthly), text_size=size.tiny, text_halign=text.align_right)
-    table.cell(tbl, 2, 14, signal_monthly != 2 ? str.tostring(delta_monthly) + "Δ" : "—", text_color=f_sig_col(signal_monthly), text_size=size.tiny)
+    // ── Row 16: Regime note when Bear
+    regime_note = regime_bear ? "⚠ BEAR: strikes widened" : ""
+    table.cell(tbl, 0, 16, regime_note, text_color=color.rgb(197, 127, 134), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl, 1, 16, "", text_size=size.tiny)
+    table.cell(tbl, 2, 16, "", text_size=size.tiny)
+
+// ─── TRANSITION MATRIX TABLE ─────────────────────────────────────────────────
+if show_matrix_table and barstate.islast
+    mat_pos = switch matrix_pos_input
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+    var tbl_m = table.new(mat_pos, 4, 6, border_width=1, border_color=color.new(#3FDE7E, 78), bgcolor=color.new(#0B0F0D, 8))
+
+    // Build P: row-normalise counts
+    P = array.new_float(9, 0.0)
+    for r = 0 to 2
+        row_sum = array.get(mkv_counts, r * 3) + array.get(mkv_counts, r * 3 + 1) + array.get(mkv_counts, r * 3 + 2)
+        for c = 0 to 2
+            cell = row_sum > 0 ? array.get(mkv_counts, r * 3 + c) / row_sum : 1.0 / 3.0
+            array.set(P, r * 3 + c, cell)
+
+    // Stationary distribution via matrix power
+    M = array.copy(P)
+    for _i = 1 to mkv_stationary_pow - 1
+        M := matmul_3x3(M, P)
+
+    // Header
+    table.cell(tbl_m, 0, 0, "MARKOV", text_color=#3FDE7E, bgcolor=color.new(#0B0F0D, 8), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(tbl_m, 1, 0, "", bgcolor=color.new(#0B0F0D, 8))
+    table.cell(tbl_m, 2, 0, "", bgcolor=color.new(#0B0F0D, 8))
+    table.cell(tbl_m, 3, 0, "3×3", text_color=color.new(color.white, 60), bgcolor=color.new(#0B0F0D, 8), text_size=size.tiny, text_halign=text.align_right)
+
+    // Column headers
+    table.cell(tbl_m, 0, 1, "", bgcolor=color.new(#0B0F0D, 8))
+    table.cell(tbl_m, 1, 1, "BULL", text_color=color.new(color.white, 35), bgcolor=color.new(#0B0F0D, 8), text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl_m, 2, 1, "BEAR", text_color=color.new(color.white, 35), bgcolor=color.new(#0B0F0D, 8), text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl_m, 3, 1, "SIDE", text_color=color.new(color.white, 35), bgcolor=color.new(#0B0F0D, 8), text_size=size.tiny, text_halign=text.align_center)
+
+    // Matrix rows
+    for r = 0 to 2
+        row_name = r == 0 ? "BULL" : r == 1 ? "BEAR" : "SIDE"
+        table.cell(tbl_m, 0, r + 2, row_name, text_color=color.new(color.white, 35), bgcolor=color.new(#0B0F0D, 8), text_size=size.tiny, text_halign=text.align_center)
+        for c = 0 to 2
+            ir = disp_to_internal(r)
+            ic = disp_to_internal(c)
+            p  = array.get(P, ir * 3 + ic)
+            is_diag = (r == c)
+            cell_bg  = is_diag ? color.new(#3FDE7E, 80) : color.new(#0B0F0D, 8)
+            cell_txt = is_diag ? #6BF0A6 : color.new(color.white, 55)
+            table.cell(tbl_m, c + 1, r + 2, fmt_pct(p), text_color=cell_txt, bgcolor=cell_bg, text_size=size.tiny, text_halign=text.align_center)
+
+    // Footer: stationary distribution
+    table.cell(tbl_m, 0, 5, "π", text_color=color.new(color.white, 60), bgcolor=color.new(#0B0F0D, 8), text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl_m, 1, 5, fmt_pct(array.get(M, 0 * 3 + 1)), text_color=#6BF0A6, bgcolor=color.new(#3FDE7E, 85), text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl_m, 2, 5, fmt_pct(array.get(M, 0 * 3 + 2)), text_color=#6BF0A6, bgcolor=color.new(#3FDE7E, 85), text_size=size.tiny, text_halign=text.align_center)
+    table.cell(tbl_m, 3, 5, fmt_pct(array.get(M, 0 * 3 + 0)), text_color=#6BF0A6, bgcolor=color.new(#3FDE7E, 85), text_size=size.tiny, text_halign=text.align_center)
 
 // ─── ALERTS ──────────────────────────────────────────────────────────────────
 alertcondition(circuit_breaker and not circuit_breaker[1], "Circuit Breaker ON", "⚠️ CIRCUIT BREAKER — Macro backwardation / Z<-2 / COR1M panic — halt all put selling")
@@ -328,3 +431,5 @@ alertcondition(signal_weekly == 0 and signal_weekly[1] != 0, "Weekly GREEN", "�
 alertcondition(signal_monthly == 0 and signal_monthly[1] != 0, "Monthly GREEN", "🟢 Monthly Entry — 5+ GREEN metrics, no REDs")
 alertcondition(vvix_red and not vvix_red[1], "VVIX Warning", "⚠️ VVIX > 115 in calm market — anticipate vol expansion")
 alertcondition(bbw_red and not bbw_red[1], "BBW Coiled Spring", "⚠️ BBW at multi-month low — breakout imminent, reduce size")
+alertcondition(regime == 2 and regime[1] != 2, "Bear Regime", "🐻 Markov regime flipped BEAR — strikes widened, GREEN blocked")
+alertcondition(regime == 1 and regime[1] != 1, "Bull Regime", "🟢 Markov regime flipped BULL — full signal set active")
