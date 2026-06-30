@@ -270,7 +270,7 @@ protobuf = "5.29.5"
 
 [package.source]
 type = "directory"
-url = "libs/twsapi/pythonclient"
+url = "misc/twsapi/pythonclient"
 
 [[package]]
 name = "identify"
@@ -1132,4 +1132,4 @@ python-discovery = ">=1.4.2"
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "458ef409e9368033c04cbe5d5c1638cd314989ece47b14745b6979bb6c793923"
+content-hash = "3ba6252fb1a6152eea0e47eec599487d5e54df32f9d425c1d2d5db83e36dea5a"
