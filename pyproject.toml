@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ibtws"
-version = "0.3.1"
+version = "0.3.2"
 description = ""
 authors = ["Home Workstation <kursus1010@gmail.com>"]
 packages = [{ include = "ibtws", from = "src" }]
