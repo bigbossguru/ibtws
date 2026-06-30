@@ -12,6 +12,7 @@ ib-async = {path = "libs/ib_async"}
 ibapi = {path = "libs/twsapi/pythonclient"}
 pandas = "^3.0.3"
 scipy = "^1.18.0"
+matplotlib = "^3.11.0"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^4.6.0"

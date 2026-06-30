@@ -13,92 +13,18 @@ Compute dealer gamma exposure across the SPX option chain to identify:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import logging
 
-import matplotlib.pyplot as plt
-import numpy as np
+import pandas as pd
 from ib_async import Index
 
 from ibtws.config import IBKRConfig
-from ibtws.unofficial.analysis.gex import GEXCalculator, GEXResult
 from ibtws.unofficial.client import IBKRClient
+from ibtws.unofficial.analysis.gex import GexCalculator
 from ibtws.unofficial.option.chains import OptionChainFetcher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
-
-
-def _print(result: GEXResult) -> None:
-    print(f"\n{'=' * 60}")
-    print(f"  GEX Analysis — {result.underlying_symbol} (spot: ${result.spot:.2f})")
-    print(f"{'=' * 60}")
-    print(f"  Total GEX:        ${result.total_gex:>16,.0f}")
-    print(f"  Call GEX Total:   ${result.call_gex_total:>16,.0f}")
-    print(f"  Put GEX Total:    ${result.put_gex_total:>16,.0f}")
-    print(f"  Net GEX:          ${result.net_gex:>16,.0f}")
-    print()
-    print(f"  Call Wall:         {result.call_wall}")
-    print(f"  Put Wall:          {result.put_wall}")
-    print(
-        f"  Zero Gamma Level:  {result.zero_gamma_level:.2f}" if result.zero_gamma_level else "  Zero Gamma Level:  n/a"
-    )
-    print()
-
-    # Top strikes by absolute net GEX
-    print("  Top 10 Strikes by |Net GEX|:")
-    print(f"  {'Strike':>8}  {'Call GEX':>14}  {'Put GEX':>14}  {'Net GEX':>14}")
-    print(f"  {'-' * 8}  {'-' * 14}  {'-' * 14}  {'-' * 14}")
-    top = sorted(result.strikes, key=lambda s: abs(s.net_gex), reverse=True)[:10]
-    for s in top:
-        print(f"  {s.strike:>8.1f}  {s.call_gex:>14,.0f}  {s.put_gex:>14,.0f}  {s.net_gex:>14,.0f}")
-
-
-def _plot(result: GEXResult) -> None:
-    strikes = np.array([s.strike for s in result.strikes])
-    call_gex = np.array([s.call_gex for s in result.strikes])
-    put_gex = np.array([s.put_gex for s in result.strikes])
-    net_gex = np.array([s.net_gex for s in result.strikes])
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
-    fig.suptitle(f"GEX Profile — {result.underlying_symbol} (spot: ${result.spot:.2f})", fontsize=14)
-
-    # --- Top panel: Call vs Put GEX stacked bars ---
-    width = np.min(np.diff(strikes)) * 0.4 if len(strikes) > 1 else 5.0
-    ax1.bar(strikes, call_gex, width=width, color="green", alpha=0.7, label="Call GEX")
-    ax1.bar(strikes, put_gex, width=width, color="red", alpha=0.7, label="Put GEX")
-    ax1.axvline(result.spot, color="blue", linestyle="--", linewidth=1.2, label=f"Spot ${result.spot:.0f}")
-    if result.call_wall:
-        ax1.axvline(
-            result.call_wall, color="darkgreen", linestyle=":", linewidth=1.5, label=f"Call Wall {result.call_wall:.0f}"
-        )
-    if result.put_wall:
-        ax1.axvline(
-            result.put_wall, color="darkred", linestyle=":", linewidth=1.5, label=f"Put Wall {result.put_wall:.0f}"
-        )
-    ax1.axhline(0, color="gray", linewidth=0.5)
-    ax1.set_ylabel("GEX ($)")
-    ax1.legend(loc="upper left", fontsize=9)
-    ax1.set_title("Call / Put GEX by Strike")
-
-    # --- Bottom panel: Net GEX ---
-    colors = ["green" if v >= 0 else "red" for v in net_gex]
-    ax2.bar(strikes, net_gex, width=width, color=colors, alpha=0.7)
-    ax2.axvline(result.spot, color="blue", linestyle="--", linewidth=1.2, label=f"Spot ${result.spot:.0f}")
-    if result.zero_gamma_level:
-        ax2.axvline(
-            result.zero_gamma_level,
-            color="purple",
-            linestyle="-.",
-            linewidth=1.5,
-            label=f"Zero Gamma {result.zero_gamma_level:.0f}",
-        )
-    ax2.axhline(0, color="gray", linewidth=0.5)
-    ax2.set_xlabel("Strike")
-    ax2.set_ylabel("Net GEX ($)")
-    ax2.legend(loc="upper left", fontsize=9)
-    ax2.set_title("Net GEX by Strike")
-
-    plt.tight_layout()
-    plt.show()
 
 
 async def main() -> None:
@@ -109,19 +35,29 @@ async def main() -> None:
         client.ib.reqMarketDataType(2)  # frozen
 
         chain_fetcher = OptionChainFetcher(client)
-        calculator = GEXCalculator(client, chain_fetcher)
+        calculator = GexCalculator()
 
         underlying = Index("SPX", "CBOE", "USD")
         [underlying] = await client.ib.qualifyContractsAsync(underlying)
 
-        result = await calculator.calculate(
+        quotes = await chain_fetcher.fetch_snapshot(
             underlying,
-            expirations=["20260601"],
+            expirations=["20260630"],
+            strike_window_pct=0.03,
             trading_class="SPXW",
-            strike_window_pct=0.05,  # ±5% around spot
+            rights=("C", "P"),
+            as_dataframe=True,
         )
-        _print(result)
-        _plot(result)
+
+        spot = quotes.iloc[0].underlying_price if isinstance(quotes, pd.DataFrame) and not quotes.empty else None
+        if not spot or spot <= 0:
+            raise ValueError(f"Cannot determine spot price for {underlying.symbol}")
+
+        if isinstance(quotes, pd.DataFrame):
+            quotes.to_csv(f"spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False)
+            calculator.compute(quotes)
+            calculator.summary()
+            calculator.plot(save_path=f"spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
 
 
 if __name__ == "__main__":
