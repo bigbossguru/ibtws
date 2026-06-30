@@ -59,7 +59,8 @@ class ExpectedMoveCalculator:
         underlying: Contract,
         expiration: str,
         *,
-        hv_lookback_days: int = 30,
+        trading_class: str | None = None,
+        hv_lookback_days: int | None = 1,
     ) -> ExpectedMoveResult:
         """Calculate expected move for *underlying* at *expiration* (YYYYMMDD).
 
@@ -77,6 +78,7 @@ class ExpectedMoveCalculator:
             expirations=[expiration],
             strike_window_pct=0.05,
             rights=("C", "P"),
+            trading_class=trading_class,
         )
 
         spot = quotes[0].underlying_price if quotes else None
@@ -92,8 +94,11 @@ class ExpectedMoveCalculator:
         iv_move = _iv_expected_move(spot, atm_iv, dte) if atm_iv else None
 
         # Method 3: historical volatility
-        hv = await self._calc_hv(underlying, hv_lookback_days)
-        hv_move = _iv_expected_move(spot, hv, dte) if hv else None
+        hv = None
+        hv_move = None
+        if hv_lookback_days is not None:
+            hv = await self._calc_hv(underlying, hv_lookback_days)
+            hv_move = _iv_expected_move(spot, hv, dte) if hv else None
 
         return ExpectedMoveResult(
             underlying_symbol=underlying.symbol,
