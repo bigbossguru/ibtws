@@ -1,3 +1,0 @@
-[submodule "libs/ib_async"]
-	path = libs/ib_async
-	url = git@github.com:bigbossguru/ib_async.git
