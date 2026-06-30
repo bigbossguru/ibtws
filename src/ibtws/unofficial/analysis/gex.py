@@ -212,7 +212,8 @@ class GexCalculator:
         """Per-strike net GEX using pre-computed gammas."""
         df = self._compute_gex_column()
         net = (
-            df.groupby("strike")["gex"]
+            df
+            .groupby("strike")["gex"]
             .sum()
             .reset_index()
             .rename(columns={"gex": "net_gex"})
