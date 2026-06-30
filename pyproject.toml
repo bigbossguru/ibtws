@@ -11,18 +11,15 @@ python = "^3.12"
 ib-async = {git = "https://github.com/bigbossguru/ib_async.git", rev = "v2.1.0"}
 pandas = ">=2.3,<4.0"
 scipy = "^1.18.0"
-matplotlib = "^3.11.0"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^4.6.0"
 pytest = "^9.0.2"
 pytest-asyncio = "^1.3.0"
 
-
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
-
 
 [tool.ruff]
 line-length = 120
