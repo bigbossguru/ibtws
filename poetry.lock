@@ -251,8 +251,10 @@ nest_asyncio = "*"
 tzdata = "^2025.2"
 
 [package.source]
-type = "directory"
-url = "libs/ib_async"
+type = "git"
+url = "https://github.com/bigbossguru/ib_async.git"
+reference = "v2.1.0"
+resolved_reference = "ab629f34c1823ea4c1542f32f07377208a86bdfd"
 
 [[package]]
 name = "ibapi"
@@ -1130,4 +1132,4 @@ python-discovery = ">=1.4.2"
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "976fd6bc768aecd1d64f10679b5a5cfe30c4def47a5c7897273a88ee3634afe7"
+content-hash = "458ef409e9368033c04cbe5d5c1638cd314989ece47b14745b6979bb6c793923"
