@@ -193,12 +193,18 @@ class GexCalculator:
         r = self.result
         return self._render_chart(r, save_path=save_path, title_suffix=title_suffix)
 
-    def _derive_params(self) -> tuple[float, float, float]:
-        """Extract spot price, time to expiry, and risk-free rate."""
-        spot = self._df["underlying_price"].iloc[0]
-        expiry = datetime.strptime(str(self._df["expiry"].iloc[0]), "%Y%m%d")
-        now = datetime.fromtimestamp(self._df["timestamp"].iloc[0])
-        T = max((expiry - now).total_seconds() / (365.25 * 24 * 3600), 1e-6)
+    def _derive_params(self):
+        spot = self._df["underlying_price"].iloc[-1]
+        # Expiry = 4pm close on the expiry date, not midnight — critical for 0DTE,
+        # where midnight vs. close is the difference between T>0 and T<0.
+        expiry = datetime.strptime(str(self._df["expiry"].iloc[-1]), "%Y%m%d").replace(hour=22, minute=0, second=0)
+        now = datetime.fromtimestamp(self._df["timestamp"].iloc[-1])
+        T = (expiry - now).total_seconds() / (365.25 * 24 * 3600)
+        if T <= 0:
+            raise ValueError(
+                f"Non-positive time to expiry ({T * 365.25:.3f} days): snapshot ({now}) is at/after "
+                f"the 4pm close on the expiry date ({expiry}). Check the timestamp's timezone matches system local time."
+            )
         return spot, T, self.risk_free_rate
 
     def _compute_gex_column(self) -> pd.DataFrame:
