@@ -24,6 +24,8 @@ Usage:
     print(calc.total_gex)
 """
 
+import io
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -176,7 +178,7 @@ class GexCalculator:
         print(text)
         return text
 
-    def plot(self, save_path: str | None = None, title_suffix: str = "") -> plt.Figure:
+    def plot(self, save_path: str | None = None, title_suffix: str = "") -> bytes:
         """
         Generate combined GEX chart: profile curve + per-strike histogram.
 
@@ -191,7 +193,12 @@ class GexCalculator:
             raise RuntimeError("Call compute() first")
 
         r = self.result
-        return self._render_chart(r, save_path=save_path, title_suffix=title_suffix)
+        fig = self._render_chart(r, save_path=save_path, title_suffix=title_suffix)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
 
     def _derive_params(self):
         spot = self._df["underlying_price"].iloc[-1]
@@ -406,7 +413,7 @@ class GexCalculator:
 
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
-            print(f"Chart saved → {save_path}")
+            logging.info(f"Chart saved → {save_path}")
         else:
             plt.show()
 
