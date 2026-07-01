@@ -1,21 +1,19 @@
-"""Expected-move calculation using three complementary methods.
+"""Expected-move calculation using two complementary methods.
 
 1. **ATM Straddle** — sum of ATM call + put mid prices (market-implied).
 2. **IV-based 1σ** — ``spot × IV × √(DTE/365)`` from ATM implied volatility.
-3. **Historical Volatility 1σ** — same formula but using realized vol from price history.
 """
 
 from __future__ import annotations
 
 import math
-import logging
-from typing import Sequence
 from dataclasses import dataclass
 
-from ibtws.unofficial.option.models import OptionQuote
+import pandas as pd
+
 from ibtws.unofficial.helpers import calc_dte
 
-logger = logging.getLogger(__name__)
+REQUIRED_COLUMNS = {"strike", "right", "bid", "ask", "iv", "underlying_price", "expiry"}
 
 
 @dataclass(frozen=True)
@@ -39,37 +37,58 @@ class ExpectedMoveResult:
 
 
 class ExpectedMoveCalculator:
-    """Compute expected move using straddle, IV, and historical volatility methods."""
+    """Compute expected move from an options chain DataFrame.
 
-    async def calculate(self, quotes: Sequence[OptionQuote]) -> ExpectedMoveResult:
-        """Calculate expected move for *underlying* at *expiration* (YYYYMMDD).
+    The DataFrame must contain at least the columns defined in
+    :data:`REQUIRED_COLUMNS`: ``strike``, ``right``, ``bid``, ``ask``, ``iv``,
+    ``underlying_price``, ``expiry``.  An optional ``symbol`` column is used
+    for the result's ``underlying_symbol``.
+
+    This aligns with the DataFrame produced by
+    :func:`~ibtws.unofficial.option.utils.quotes_to_dataframe`.
+    """
+
+    REQUIRED_COLUMNS = REQUIRED_COLUMNS
+
+    def calculate(self, df: pd.DataFrame) -> ExpectedMoveResult:
+        """Calculate expected move from an options chain DataFrame.
 
         Parameters
         ----------
-        quotes:
-            List of option quotes for the underlying at the target expiration.
+        df:
+            Options chain DataFrame with columns matching
+            :data:`REQUIRED_COLUMNS`.
+
+        Returns
+        -------
+        ExpectedMoveResult
+            Aggregated expected-move estimates.
+
+        Raises
+        ------
+        ValueError
+            If *df* is empty or missing required columns/data.
         """
-        first_quote = quotes[0] if quotes else None
-        if first_quote is None:
-            raise ValueError("Cannot determine contract details from empty quotes list")
+        if df.empty:
+            raise ValueError("Cannot calculate expected move from empty DataFrame")
 
-        spot = first_quote.underlying_price
-        if spot is None:
-            symbol = getattr(first_quote.contract, "symbol", None)
-            raise ValueError(f"Cannot determine spot price for {symbol or 'unknown'}")
+        missing = self.REQUIRED_COLUMNS - set(df.columns)
+        if missing:
+            raise ValueError(f"DataFrame missing required columns: {sorted(missing)}")
 
-        expiration = getattr(first_quote.contract, "lastTradeDateOrContractMonth", None)
-        if not expiration:
-            raise ValueError("Cannot determine expiration from quote")
+        # Derive spot & expiration from the DataFrame
+        spot = self._extract_spot(df)
+        expiration = self._extract_expiration(df)
+        symbol = self._extract_symbol(df)
 
         # Method 1 & 2: from option quotes
-        atm_call, atm_put = self._find_atm_pair(quotes, spot)
+        atm_call, atm_put = self._find_atm_pair(df, spot)
         straddle_move = self._straddle_expected_move(atm_call, atm_put)
         atm_iv = self._extract_atm_iv(atm_call, atm_put)
         iv_move = self._iv_expected_move(spot, atm_iv, expiration) if atm_iv else None
 
         return ExpectedMoveResult(
-            underlying_symbol=getattr(first_quote.contract, "symbol", None) or "",
+            underlying_symbol=symbol,
             spot=spot,
             expiration=expiration,
             straddle_move=straddle_move,
@@ -80,23 +99,64 @@ class ExpectedMoveCalculator:
             avg_move=(straddle_move + iv_move) / 2.0 if straddle_move is not None and iv_move is not None else None,
         )
 
-    def _find_atm_pair(
-        self, quotes: Sequence[OptionQuote], spot: float
-    ) -> tuple[OptionQuote | None, OptionQuote | None]:
-        """Find the call and put closest to spot."""
-        calls = [q for q in quotes if q.contract.right == "C"]
-        puts = [q for q in quotes if q.contract.right == "P"]
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        atm_call = min(calls, key=lambda q: abs(q.contract.strike - spot), default=None)
-        atm_put = min(puts, key=lambda q: abs(q.contract.strike - spot), default=None)
+    def _extract_spot(self, df: pd.DataFrame) -> float:
+        """Get spot price from underlying_price column."""
+        prices = df["underlying_price"].dropna()
+        if prices.empty:
+            raise ValueError("Cannot determine spot price: all underlying_price values are NaN")
+        spot = float(prices.iloc[0])
+        if spot <= 0:
+            raise ValueError(f"Invalid spot price: {spot}")
+        return spot
+
+    def _extract_expiration(self, df: pd.DataFrame) -> str:
+        """Get expiration from expiry column (first non-null value)."""
+        expiries = df["expiry"].dropna()
+        if expiries.empty:
+            raise ValueError("Cannot determine expiration: all expiry values are NaN")
+        return str(expiries.iloc[0])
+
+    def _extract_symbol(self, df: pd.DataFrame) -> str:
+        """Get symbol if available."""
+        if "symbol" not in df.columns:
+            return ""
+        symbols = df["symbol"].dropna()
+        return str(symbols.iloc[0]) if not symbols.empty else ""
+
+    def _find_atm_pair(self, df: pd.DataFrame, spot: float) -> tuple[pd.Series | None, pd.Series | None]:
+        """Find the call and put row closest to spot."""
+        calls = df[df["right"] == "C"]
+        puts = df[df["right"] == "P"]
+
+        atm_call = None
+        atm_put = None
+
+        if not calls.empty:
+            idx = (calls["strike"] - spot).abs().idxmin()
+            atm_call = calls.loc[idx]
+
+        if not puts.empty:
+            idx = (puts["strike"] - spot).abs().idxmin()
+            atm_put = puts.loc[idx]
+
         return atm_call, atm_put
 
-    def _quote_mid(self, quote: OptionQuote) -> float | None:
-        if quote.bid is None or quote.ask is None or quote.bid <= 0 or quote.ask <= 0 or quote.ask < quote.bid:
+    def _quote_mid(self, row: pd.Series) -> float | None:
+        """Calculate mid price from a row; returns None if invalid."""
+        bid = row.get("bid")
+        ask = row.get("ask")
+        if bid is None or ask is None or pd.isna(bid) or pd.isna(ask):
             return None
-        return (quote.bid + quote.ask) / 2.0
+        bid, ask = float(bid), float(ask)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        return (bid + ask) / 2.0
 
-    def _straddle_expected_move(self, atm_call: OptionQuote | None, atm_put: OptionQuote | None) -> float | None:
+    def _straddle_expected_move(self, atm_call: pd.Series | None, atm_put: pd.Series | None) -> float | None:
         """Expected move = ATM call mid + ATM put mid."""
         if atm_call is None or atm_put is None:
             return None
@@ -106,9 +166,15 @@ class ExpectedMoveCalculator:
             return None
         return call_mid + put_mid
 
-    def _extract_atm_iv(self, atm_call: OptionQuote | None, atm_put: OptionQuote | None) -> float | None:
+    def _extract_atm_iv(self, atm_call: pd.Series | None, atm_put: pd.Series | None) -> float | None:
         """Average IV of ATM call and put."""
-        ivs = [q.iv for q in (atm_call, atm_put) if q and q.iv and q.iv > 0]
+        ivs: list[float] = []
+        for row in (atm_call, atm_put):
+            if row is None:
+                continue
+            iv = row.get("iv")
+            if iv is not None and not pd.isna(iv) and float(iv) > 0:
+                ivs.append(float(iv))
         return sum(ivs) / len(ivs) if ivs else None
 
     def _iv_expected_move(self, spot: float, iv: float, expiration: str) -> float | None:

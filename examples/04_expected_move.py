@@ -1,10 +1,9 @@
 """04 — Expected Move.
 
-Calculate the expected move for an underlying using all three methods:
+Calculate the expected move for an underlying using two methods:
 
 1. ATM Straddle price (market-implied)
 2. ATM Implied Volatility × √(DTE/365)
-3. Historical Volatility × √(DTE/365)
 
 Uses frozen market data (``reqMarketDataType(2)``) so the example works when
 the live feed is locked by another session.
@@ -21,6 +20,7 @@ from ibtws.config import IBKRConfig
 from ibtws.unofficial.client import IBKRClient
 from ibtws.unofficial.analysis.expected_move import ExpectedMoveCalculator, ExpectedMoveResult
 from ibtws.unofficial.option.chains import OptionChainFetcher
+from ibtws.unofficial.option.utils import quotes_to_dataframe
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 
@@ -44,10 +44,12 @@ def _print(result: ExpectedMoveResult) -> None:
     else:
         print("    n/a (IV unavailable)")
     print()
-    print("  Method 3 — Average Expected Move:")
+    print("  Average Expected Move:")
     if result.avg_move:
         print(f"    EM: ±${result.avg_move:.2f}")
         print(f"    Range: ${result.spot - result.avg_move:.2f} – ${result.spot + result.avg_move:.2f}")
+    else:
+        print("    n/a (insufficient data for average)")
     print()
 
 
@@ -72,7 +74,10 @@ async def main() -> None:
             rights=("C", "P"),
             trading_class="SPXW",
         )
-        result = await em_calculator.calculate(quotes)
+
+        # Convert to DataFrame and calculate expected move
+        df = quotes_to_dataframe(quotes)
+        result = em_calculator.calculate(df)
         _print(result)
 
 
