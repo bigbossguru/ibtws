@@ -42,7 +42,7 @@ async def main() -> None:
 
         quotes = await chain_fetcher.fetch_snapshot(
             underlying,
-            expirations=["20260630"],
+            expirations=["20260701"],
             strike_window_pct=0.03,
             trading_class="SPXW",
             rights=("C", "P"),
