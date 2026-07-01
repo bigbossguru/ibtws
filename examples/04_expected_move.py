@@ -13,7 +13,6 @@ the live feed is locked by another session.
 from __future__ import annotations
 
 import asyncio
-import datetime as _dt
 import logging
 
 from ib_async import Index
@@ -27,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 
 def _print(result: ExpectedMoveResult) -> None:
-    print(f"\n=== {result.underlying_symbol} — expiry {result.expiration} ({result.dte:.0f} DTE) ===")
+    print(f"\n=== {result.underlying_symbol} — expiry {result.expiration} ===")
     print(f"  Spot: ${result.spot:.2f}")
     print()
     print("  Method 1 — ATM Straddle (market-implied):")
@@ -45,13 +44,11 @@ def _print(result: ExpectedMoveResult) -> None:
     else:
         print("    n/a (IV unavailable)")
     print()
-    print("  Method 3 — Historical Volatility 1σ:")
-    if result.hv_move and result.hv:
-        print(f"    HV (30d): {result.hv * 100:.1f}%")
-        print(f"    EM: ±${result.hv_move:.2f}  ({result.hv_pct:.2f}%)")
-        print(f"    Range: ${result.spot - result.hv_move:.2f} – ${result.spot + result.hv_move:.2f}")
-    else:
-        print("    n/a (historical data unavailable)")
+    print("  Method 3 — Average Expected Move:")
+    if result.avg_move:
+        print(f"    EM: ±${result.avg_move:.2f}")
+        print(f"    Range: ${result.spot - result.avg_move:.2f} – ${result.spot + result.avg_move:.2f}")
+    print()
 
 
 async def main() -> None:
@@ -62,21 +59,20 @@ async def main() -> None:
         client.ib.reqMarketDataType(2)  # frozen
 
         chain_fetcher = OptionChainFetcher(client)
-        calculator = ExpectedMoveCalculator(client, chain_fetcher)
+        em_calculator = ExpectedMoveCalculator()
 
         underlying = Index("SPX", "CBOE", "USD")
         [underlying] = await client.ib.qualifyContractsAsync(underlying)
 
-        # Pick the nearest monthly expiration (~30 DTE)
-        chain_def = await chain_fetcher.fetch_chain_definition(underlying)
-        today = _dt.date.today()
-        target_dte = 30
-        expiration = min(
-            chain_def.expirations,
-            key=lambda e: abs((_dt.datetime.strptime(e, "%Y%m%d").date() - today).days - target_dte),
+        expiration = "20260701"
+        quotes = await chain_fetcher.fetch_snapshot(
+            underlying,
+            expirations=[expiration],
+            strike_window_pct=0.01,
+            rights=("C", "P"),
+            trading_class="SPXW",
         )
-
-        result = await calculator.calculate(underlying, expiration, hv_lookback_days=30)
+        result = await em_calculator.calculate(quotes)
         _print(result)
 
 
