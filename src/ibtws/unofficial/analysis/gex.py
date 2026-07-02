@@ -61,6 +61,8 @@ class GexResult:
     sweep_levels: np.ndarray = field(default_factory=lambda: np.array([]))
     sweep_gex: np.ndarray = field(default_factory=lambda: np.array([]))
     net_gex_by_strike: pd.DataFrame = field(default_factory=pd.DataFrame)
+    skew: float | None = None  # optional skew metric
+    skew_ratio: float | None = None  # optional skew ratio metric
 
 
 class GexCalculator:
@@ -103,6 +105,7 @@ class GexCalculator:
         net = self._calc_static_gex()
         df_gex = self._compute_gex_column()
         zgl_info = self._find_zero_gamma()
+        skew, skew_ratio = self._calculate_skew(df[df["right"] == "C"], df[df["right"] == "P"])
 
         # Extract key metrics
         call_gex = df_gex[df_gex["right"] == "C"]["gex"].sum()
@@ -131,6 +134,8 @@ class GexCalculator:
             sweep_levels=zgl_info["sweep"],
             sweep_gex=zgl_info["gex_curve"],
             net_gex_by_strike=net,
+            skew=skew,
+            skew_ratio=skew_ratio,
         )
         return self.result
 
@@ -148,6 +153,19 @@ class GexCalculator:
     def total_gex(self) -> float | None:
         """Total net GEX at current spot ($)."""
         return self.result.total_gex if self.result else None
+
+    def _calculate_skew(
+        self, call: pd.DataFrame, put: pd.DataFrame, delta: float = 0.25
+    ) -> tuple[float | None, float | None]:
+        """Calculate 25-delta skew (put_iv - call_iv) and skew ratio (put_iv / call_iv)."""
+        try:
+            put_iv = put.loc[put["delta"].sub(-delta).abs().idxmin()]["iv"]
+            call_iv = call.loc[call["delta"].sub(delta).abs().idxmin()]["iv"]
+            skew = (put_iv - call_iv) * 100
+            skew_ratio = put_iv / call_iv if call_iv != 0 else None
+            return skew, skew_ratio
+        except Exception:
+            return None, None
 
     def summary(self) -> str:
         """Return formatted summary string. Also prints to stdout."""
@@ -171,6 +189,8 @@ class GexCalculator:
             f"  Net GEX (snapshot) : ${r.total_gex / 1e6:.2f}M",
             f"  Call Wall          : {int(r.call_wall)}",
             f"  Put Wall           : {int(r.put_wall)}",
+            f"  Skew               : {r.skew}" if r.skew is not None else "",
+            f"  Skew Ratio         : {r.skew_ratio}" if r.skew_ratio is not None else "",
             "=" * 52,
         ])
 
