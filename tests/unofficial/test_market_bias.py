@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from ibtws.unofficial.analysis.market_bias import determine_market_bias
 
@@ -23,6 +24,26 @@ class TestGuards:
         result = determine_market_bias(df)
         assert result["bias"] == "!neutral"
         assert result["details"]["reason"] == "insufficient_data"
+
+    def test_missing_close_column_returns_not_neutral(self):
+        df = pd.DataFrame({"open": [1.0] * 25})
+        result = determine_market_bias(df)
+        assert result["bias"] == "!neutral"
+        assert result["details"]["reason"] == "missing_close_column"
+
+    def test_nan_in_window_returns_not_neutral(self):
+        closes = [float(i) for i in range(1, 25)] + [float("nan")]
+        result = determine_market_bias(_series_df(closes))
+        assert result["bias"] == "!neutral"
+        assert result["details"]["reason"] == "nan_in_window"
+
+    def test_raises_on_non_positive_window(self):
+        with pytest.raises(ValueError, match="window lengths must be >= 1"):
+            determine_market_bias(_series_df([1.0] * 25), fast_window=0)
+
+    def test_raises_when_fast_not_smaller_than_slow(self):
+        with pytest.raises(ValueError, match="strictly smaller"):
+            determine_market_bias(_series_df([1.0] * 25), fast_window=10, slow_window=10)
 
 
 class TestBias:
