@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.11] - 2026-08-05
+
+### Bug Fixes
+
+- Fix typo in help target description (#27)
+
+Corrected a typo in the help target description.
+
+### Features
+
+- Volatility risk and market bias (#26)
+
 ## [0.3.10] - 2026-07-02
 
 ### Refactoring
