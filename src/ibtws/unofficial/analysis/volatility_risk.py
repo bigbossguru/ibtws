@@ -14,6 +14,7 @@ so it is reusable across any short-premium bot and trivially testable.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from typing import Any, Literal
 
@@ -78,11 +79,25 @@ TERM_SLOPE_BRACKETS = [
 
 
 def _lookup_bracket(value: float, brackets: Sequence[tuple[Any, ...]]) -> tuple[Any, ...]:
-    """Return the first bracket whose threshold exceeds *value*."""
+    """Return the first bracket whose threshold exceeds *value*.
+
+    Guards against NaN: a NaN *value* never satisfies ``value < threshold`` and
+    would otherwise silently fall through to the most severe bracket, so it is
+    rejected explicitly.
+    """
+    if isinstance(value, float) and math.isnan(value):
+        raise ValueError("_lookup_bracket received NaN; upstream metric is undefined.")
     for entry in brackets:
         if value < entry[0]:
             return entry
     return brackets[-1]
+
+
+def _validate_positive_finite(**values: float) -> None:
+    """Raise ``ValueError`` if any named value is not a positive, finite number."""
+    for name, value in values.items():
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be a positive finite number, got {value!r}.")
 
 
 def common_volatility_risk(
@@ -138,8 +153,16 @@ def common_volatility_risk(
     Raises
     ------
     ValueError
-        If ``vix_series`` has fewer than ``lookback_days + 1`` rows.
+        If ``vix_series`` has fewer than ``lookback_days + 1`` rows, contains
+        NaNs in the window used for scoring, or if any of the current VIX /
+        VIX1D / VIX3M inputs are non-positive or non-finite. Failing loudly is
+        intentional: a caller relying on this as a trade gate should treat bad
+        data as a hard block (fail-closed) rather than receive a silently
+        maxed-out score.
     """
+    if lookback_days < 1:
+        raise ValueError(f"lookback_days must be >= 1, got {lookback_days}.")
+
     if len(vix_series) < lookback_days + 1:
         raise ValueError(
             f"vix_series has {len(vix_series)} rows; need at least {lookback_days + 1} (lookback_days + 1)."
@@ -150,8 +173,22 @@ def common_volatility_risk(
     # ------------------------------------------------------------------
     # Raw metrics
     # ------------------------------------------------------------------
-    vix_current = vix_series.iloc[-1]
-    vix_prev = vix_series.iloc[-2]
+    # Only the tail actually used for scoring (current + prev + lookback window)
+    # needs to be clean; earlier history is irrelevant and may legitimately
+    # contain gaps.
+    window = vix_series.iloc[-(lookback_days + 1) :]
+    if window.isna().any():
+        raise ValueError(
+            "vix_series contains NaN in the scoring window "
+            f"(last {lookback_days + 1} observations); cannot compute a reliable score."
+        )
+
+    vix_current = float(vix_series.iloc[-1])
+    vix_prev = float(vix_series.iloc[-2])
+    _validate_positive_finite(vix_current=vix_current, vx1d_current=vx1d_current)
+    if vix3m_current is not None:
+        _validate_positive_finite(vix3m_current=vix3m_current)
+
     vix_hist = vix_series.iloc[-(lookback_days + 1) : -1]
     vix_mean = vix_hist.mean()
     vix_std = vix_hist.std()
