@@ -356,13 +356,16 @@ class OrderManager:
         quantity: float,
         *,
         take_profit_price: float,
-        stop_loss_price: float,
+        stop_loss_price: Optional[float] = None,
         entry_limit_price: Optional[float] = None,
         tif: TimeInForce = TimeInForce.DAY,
         account: Optional[str] = None,
         outside_rth: bool = False,
     ) -> list[TrackedOrder]:
-        """Build a bracket request and submit it in one call."""
+        """Build a bracket request and submit it in one call.
+
+        ``stop_loss_price=None`` submits a TP-only bracket (entry + take-profit).
+        """
         return await self.place_bracket(
             build_bracket(
                 contract,

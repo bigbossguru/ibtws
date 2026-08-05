@@ -107,7 +107,7 @@ def build_bracket(
     quantity: float,
     *,
     take_profit_price: float,
-    stop_loss_price: float,
+    stop_loss_price: Optional[float] = None,
     entry_limit_price: Optional[float] = None,
     tif: TimeInForce = TimeInForce.DAY,
     account: Optional[str] = None,
@@ -161,20 +161,25 @@ def bracket_to_orders(
     parent_order_id: int,
     oca_group: str,
 ) -> list[Order]:
-    """Build a parent + take-profit + stop-loss triplet with real IB bracket wiring.
+    """Build a parent + take-profit (+ optional stop-loss) with IB bracket wiring.
 
     Two IB mechanisms are applied:
 
     * ``child.parentId = parent.orderId`` — IB cancels the children automatically
       if the parent is cancelled pre-fill, and activates them once parent fills.
-    * Shared ``ocaGroup`` + ``ocaType=1`` on TP and SL — when one fills or is
-      cancelled, IB cancels the other (cancel-with-block).
+    * When a stop-loss is present, a shared ``ocaGroup`` + ``ocaType=1`` on TP
+      and SL means IB cancels the other when one fills or is cancelled
+      (cancel-with-block).
+
+    If ``request.stop_loss_price`` is ``None`` only ``[parent, take_profit]`` is
+    returned (TP-only bracket); the take-profit then transmits the group.
 
     The parent's ``orderId`` must be pre-allocated by the caller (typically via
     ``ib.client.getReqId()``) so the children's ``parentId`` can reference it
     before any ``placeOrder`` call.
     """
     exit_side = OrderSide.SELL if request.side == OrderSide.BUY else OrderSide.BUY
+    has_sl = request.stop_loss_price is not None
 
     parent: Order
     if request.entry_limit_price is None:
@@ -192,9 +197,21 @@ def bracket_to_orders(
     take_profit.tif = request.tif.value
     take_profit.outsideRth = bool(request.outside_rth)
     take_profit.parentId = parent_order_id
-    take_profit.ocaGroup = oca_group
-    take_profit.ocaType = 1  # cancel-with-block
-    take_profit.transmit = False
+    if has_sl:
+        # OCA pair with the stop-loss; SL transmits the whole group.
+        take_profit.ocaGroup = oca_group
+        take_profit.ocaType = 1  # cancel-with-block
+        take_profit.transmit = False
+    else:
+        # TP-only: this order transmits the group atomically.
+        take_profit.transmit = True
+
+    if request.account:
+        parent.account = request.account
+        take_profit.account = request.account
+
+    if not has_sl:
+        return [parent, take_profit]
 
     stop_loss = StopOrder(exit_side.value, request.quantity, request.stop_loss_price)
     stop_loss.orderRef = sl_ref
@@ -204,9 +221,7 @@ def bracket_to_orders(
     stop_loss.ocaGroup = oca_group
     stop_loss.ocaType = 1
     stop_loss.transmit = True  # transmits the whole group atomically
-
     if request.account:
-        for o in (parent, take_profit, stop_loss):
-            o.account = request.account
+        stop_loss.account = request.account
 
     return [parent, take_profit, stop_loss]

@@ -103,13 +103,19 @@ class StopRequest:
 
 @dataclass(frozen=True)
 class BracketRequest:
-    """One atomic submit = entry leg + TP limit + SL stop, OCA-grouped."""
+    """One atomic submit = entry leg + TP limit + optional SL stop.
+
+    When ``stop_loss_price`` is set, TP and SL are OCA-grouped (one filling
+    cancels the other). When it is ``None``, only entry + TP are submitted and
+    the TP is attached to the parent via ``parentId`` (IB cancels it if the
+    parent is cancelled pre-fill).
+    """
 
     contract: Any
     side: OrderSide
     quantity: float
     take_profit_price: float
-    stop_loss_price: float
+    stop_loss_price: Optional[float] = None
     entry_limit_price: Optional[float] = None  # None → market entry
     tif: TimeInForce = TimeInForce.GTC
     account: Optional[str] = None
