@@ -256,7 +256,7 @@ Pure data — no I/O, no IB calls. Symmetric (de)serialisation:
 flattener used everywhere events touch disk.
 
 **Frozen request dataclasses.** `MarketRequest`, `LimitRequest`,
-`StopRequest`, `BracketRequest` (entry + TP + SL, OCA-grouped).
+`StopRequest`, `BracketRequest` (entry + TP, plus optional OCA-grouped SL).
 
 **Runtime.**
 - `TrackedOrder` (mutable) — live view of one submitted order, kept in sync
@@ -283,9 +283,9 @@ them into raw `ib_async.Order` objects.
 | `build_market(contract, side, qty, *, tif=DAY, account=None, outside_rth=False)` | `MarketRequest` |
 | `build_limit(contract, side, qty, limit_price, *, ...)` | `LimitRequest` |
 | `build_stop(contract, side, qty, stop_price, *, ...)` | `StopRequest` |
-| `build_bracket(contract, side, qty, *, take_profit_price, stop_loss_price, entry_limit_price=None, ...)` | `BracketRequest` (`entry_limit_price=None` → market entry) |
+| `build_bracket(contract, side, qty, *, take_profit_price, stop_loss_price=None, entry_limit_price=None, ...)` | `BracketRequest` (`stop_loss_price=None` → TP-only; `entry_limit_price=None` → market entry) |
 | `request_to_order(request, order_ref)` | Translate one request → `Order` |
-| `bracket_to_orders(req, parent_ref, tp_ref, sl_ref, *, parent_order_id, oca_group)` | Three wired `Order`s: parent + TP + SL. Parent/TP `transmit=False`, SL `transmit=True` (atomic group transmit), shared `ocaGroup`, `ocaType=1` |
+| `bracket_to_orders(req, parent_ref, tp_ref, sl_ref, *, parent_order_id, oca_group)` | Wired `Order`s: parent + TP (+ SL when set). With SL: parent/TP `transmit=False`, SL `transmit=True`, TP/SL share `ocaGroup`+`ocaType=1`. TP-only: returns `[parent, TP]`, TP transmits the group. BAG contracts skip positivity/geometry checks (signed net prices) |
 
 ### `order.utils`
 

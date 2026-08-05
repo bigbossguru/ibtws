@@ -251,9 +251,11 @@ class OrderManager:
         return tracked
 
     async def place_bracket(self, request: BracketRequest) -> list[TrackedOrder]:
-        """Submit a bracket (entry + TP + SL) as one atomic group.
+        """Submit a bracket (entry + TP, plus optional SL) as one atomic group.
 
-        Returns three :class:`TrackedOrder`s with a shared ``bracket_group``.
+        Returns the :class:`TrackedOrder`s sharing a ``bracket_group``: three
+        when a stop-loss is present (parent + TP + SL), two for a TP-only
+        bracket (parent + TP).
         """
         self._require_started()
         validate_request(request)
@@ -275,9 +277,12 @@ class OrderManager:
         # Persist the group submission first.
         await self._store.append(_build_submitted_event(parent_uuid, request, bracket_group=group))
 
+        # zip truncates to len(orders): TP-only brackets yield [parent, tp] and
+        # the trailing sl_uuid is simply unused.
+        uuids = (parent_uuid, tp_uuid, sl_uuid)
         tracked_list: list[TrackedOrder] = []
         async with self._slot():
-            for o, uuid in zip(orders, (parent_uuid, tp_uuid, sl_uuid)):
+            for o, uuid in zip(orders, uuids):
                 trade = self._client.ib.placeOrder(request.contract, o)
                 tracked = TrackedOrder(
                     uuid=uuid,
