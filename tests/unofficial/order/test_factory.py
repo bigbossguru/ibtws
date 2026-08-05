@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from ib_async import LimitOrder, MarketOrder, StopOrder
 
@@ -149,3 +151,93 @@ def test_bracket_to_orders_limit_entry_sell():
     assert sl.action == "BUY"
     assert tp.parentId == 7 and sl.parentId == 7
     assert tp.ocaGroup == "g" and sl.ocaGroup == "g"
+
+
+# ---------------------------------------------------------------------------
+# TP-only bracket (stop_loss_price=None)
+# ---------------------------------------------------------------------------
+
+
+def _bag_contract(symbol: str = "SPX"):
+    """A minimal BAG (combo) contract with two qualified legs."""
+    return SimpleNamespace(
+        conId=0,
+        symbol=symbol,
+        secType="BAG",
+        exchange="SMART",
+        currency="USD",
+        strike=0.0,
+        right="",
+        lastTradeDateOrContractMonth="",
+        tradingClass="",
+        multiplier="",
+        comboLegs=[
+            SimpleNamespace(conId=111, ratio=1, action="SELL", exchange="SMART"),
+            SimpleNamespace(conId=222, ratio=1, action="BUY", exchange="SMART"),
+        ],
+    )
+
+
+def test_build_bracket_tp_only_allows_missing_sl():
+    c = make_contract()
+    req = build_bracket(c, OrderSide.BUY, 1, take_profit_price=110)
+    assert isinstance(req, BracketRequest)
+    assert req.stop_loss_price is None
+
+
+def test_build_bracket_tp_only_skips_geometry_check():
+    # Without an SL there is no TP/SL geometry to validate — must not raise.
+    c = make_contract()
+    req = build_bracket(c, OrderSide.BUY, 1, take_profit_price=100)
+    assert req.take_profit_price == 100
+
+
+def test_bracket_to_orders_tp_only_returns_two_orders():
+    req = BracketRequest(
+        contract=make_contract(),
+        side=OrderSide.BUY,
+        quantity=1,
+        take_profit_price=110,
+        stop_loss_price=None,
+        entry_limit_price=100,
+    )
+    orders = bracket_to_orders(req, "p", "tp", "sl", parent_order_id=5, oca_group="g")
+    assert len(orders) == 2
+    parent, tp = orders
+    assert isinstance(parent, LimitOrder) and parent.transmit is False
+    assert isinstance(tp, LimitOrder) and tp.action == "SELL"
+    assert tp.parentId == 5
+    # TP transmits the group when there is no SL; no OCA group needed.
+    assert tp.transmit is True
+    assert not getattr(tp, "ocaGroup", "")
+
+
+def test_build_bracket_combo_allows_signed_prices():
+    # A credit spread: BUY BAG @ -credit, TP = SELL BAG @ -tp_debit (negative).
+    bag = _bag_contract()
+    req = build_bracket(
+        bag,
+        OrderSide.BUY,
+        1,
+        take_profit_price=-0.60,
+        entry_limit_price=-1.70,
+    )
+    assert req.stop_loss_price is None
+    assert req.take_profit_price == -0.60
+
+
+def test_bracket_to_orders_combo_tp_only():
+    bag = _bag_contract()
+    req = BracketRequest(
+        contract=bag,
+        side=OrderSide.BUY,
+        quantity=1,
+        take_profit_price=-0.60,
+        stop_loss_price=None,
+        entry_limit_price=-1.70,
+    )
+    parent, tp = bracket_to_orders(req, "p", "tp", "sl", parent_order_id=9, oca_group="g")
+    assert parent.lmtPrice == -1.70
+    assert tp.lmtPrice == -0.60
+    assert tp.action == "SELL"
+    assert tp.transmit is True

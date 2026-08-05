@@ -64,14 +64,20 @@ def validate_request(request: Any) -> None:
     if isinstance(request, StopRequest) and request.stop_price <= 0:
         raise ValueError(f"stop_price must be positive, got {request.stop_price!r}")
     if isinstance(request, BracketRequest):
-        if request.take_profit_price <= 0:
+        # BAG (combo) brackets use *signed net* prices (negative = credit), so
+        # positivity and geometry checks only apply to single-leg contracts.
+        is_bag = getattr(contract, "secType", "") == "BAG"
+        if not is_bag and request.take_profit_price <= 0:
             raise ValueError(f"take_profit_price must be positive, got {request.take_profit_price!r}")
-        if request.stop_loss_price <= 0:
-            raise ValueError(f"stop_loss_price must be positive, got {request.stop_loss_price!r}")
-        if request.entry_limit_price is not None and request.entry_limit_price <= 0:
+        if request.stop_loss_price is not None and not is_bag and request.stop_loss_price <= 0:
+            raise ValueError(f"stop_loss_price must be positive when set, got {request.stop_loss_price!r}")
+        if request.entry_limit_price is not None and not is_bag and request.entry_limit_price <= 0:
             raise ValueError(f"entry_limit_price must be positive when set, got {request.entry_limit_price!r}")
-        # Sanity-check TP/SL geometry vs side.
-        if request.side == OrderSide.BUY and request.take_profit_price <= request.stop_loss_price:
-            raise ValueError("For BUY bracket: take_profit_price must be above stop_loss_price.")
-        if request.side == OrderSide.SELL and request.take_profit_price >= request.stop_loss_price:
-            raise ValueError("For SELL bracket: take_profit_price must be below stop_loss_price.")
+        # Sanity-check TP/SL geometry vs side — only when an SL is present and
+        # the contract is single-leg (combo net prices are signed and would
+        # invert these comparisons).
+        if request.stop_loss_price is not None and not is_bag:
+            if request.side == OrderSide.BUY and request.take_profit_price <= request.stop_loss_price:
+                raise ValueError("For BUY bracket: take_profit_price must be above stop_loss_price.")
+            if request.side == OrderSide.SELL and request.take_profit_price >= request.stop_loss_price:
+                raise ValueError("For SELL bracket: take_profit_price must be below stop_loss_price.")

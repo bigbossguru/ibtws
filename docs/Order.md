@@ -115,21 +115,36 @@ tracked = await manager.stop_order(
 )
 ```
 
-### Bracket (Entry + Take-Profit + Stop-Loss)
+### Bracket (Entry + Take-Profit + optional Stop-Loss)
 
 ```python
+# Full bracket: entry + TP + SL
 parent, tp, sl = await manager.bracket(
     contract, OrderSide.BUY, quantity=5,
     entry_limit_price=150.0,   # None → market entry
     take_profit_price=170.0,
-    stop_loss_price=140.0,
+    stop_loss_price=140.0,     # omit / None → TP-only bracket
     tif=TimeInForce.GTC,
 )
-# All three share parent.bracket_group
+# parent, tp, sl share parent.bracket_group
+
+# TP-only bracket: entry + TP (no stop-loss)
+parent, tp = await manager.bracket(
+    contract, OrderSide.BUY, quantity=5,
+    entry_limit_price=150.0,
+    take_profit_price=170.0,
+)
 ```
 
-IB wiring: children have `parentId` pointing to the parent, and TP/SL share an
-OCA group (cancel-with-block: when one fills, IB cancels the other).
+IB wiring: children have `parentId` pointing to the parent. When a stop-loss is
+present, TP/SL share an OCA group (cancel-with-block: when one fills, IB cancels
+the other) and the SL transmits the group; for a TP-only bracket the TP itself
+transmits the group.
+
+For **combo (BAG)** contracts the bracket prices are *signed net* values
+(negative = credit): e.g. a credit spread enters `BUY BAG @ -credit` with a
+take-profit `SELL BAG @ -tp_debit`. Positivity and TP/SL geometry validation is
+skipped for BAG contracts since those checks assume single-leg positive prices.
 
 ### BAG / Combo Orders
 
