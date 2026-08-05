@@ -2,7 +2,7 @@
 
 .DEFAULT_GOAL := help
 
-help:  ## Show this help message
+help:  ## Show this help messagee
 	@grep -E '^[a-zA-Z_-]+:.*?##' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-12s %s\n", $$1, $$2}'
 
 install:  ## Install the poetry environment and pre-commit hooks
