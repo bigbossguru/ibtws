@@ -1,7 +1,7 @@
 # ibtws — Module Reference
 
-A resilient async Python layer over `ib_async` for IBKR TWS/Gateway. This
-document is a per-module reference covering public surface, behaviour, and
+A thin, resilient async Python layer over `ib_async` for IBKR TWS/Gateway.
+This document is a per-module reference covering public surface, behaviour, and
 key tunables. For runnable end-to-end usage see `examples/`.
 
 ## Architectural layers
@@ -9,11 +9,10 @@ key tunables. For runnable end-to-end usage see `examples/`.
 ```
 ibtws/
 ├── config.py                     # IBKRConfig — single tunable dataclass
-├── official/                     # placeholder (no impl yet)
 └── unofficial/                   # production layer
-    ├── client.py                 # IBKRClient — connection + reconnect + watchdog
+    ├── client.py                 # IBKRClient — connect / market + historical data
+    ├── helpers.py                # safe_pick_value / calc_dte / chunked
     ├── _pacing.py                # ThrottledExecutor — shared rate-limit slot
-    ├── _ib_errors.py             # classify(code) → ErrorCategory
     ├── option/                   # chain definition + quote snapshots + IV rank
     │   ├── chains.py
     │   ├── iv_rank.py
@@ -27,19 +26,25 @@ ibtws/
     │   ├── factory.py            # build_market / build_limit / build_stop / build_bracket
     │   ├── models.py             # requests, events, runtime dataclasses
     │   └── utils.py              # validate_request, make_order_ref, is_paper_account
+    ├── analysis/                 # pure analytics over chain / price DataFrames
+    │   ├── gex.py                # GexCalculator — gamma exposure profile
+    │   ├── expected_move.py      # ExpectedMoveCalculator
+    │   ├── market_bias.py        # determine_market_bias
+    │   └── volatility_risk.py    # common_volatility_risk
     └── strategies/
         └── credit_spread.py      # vertical credit-spread strategy (BAG combo)
 ```
 
 **Dependency direction (clean):** strategies → order/option → client → ib_async.
-Lower layers never import upward.
+Lower layers never import upward. The `analysis` package is pure (pandas / numpy /
+scipy only) and does not import the client — it operates on DataFrames produced
+by the option layer.
 
 ---
 
 ## `ibtws.config`
 
-Single dataclass holding every tunable: connection, reconnect, watchdog,
-quote-freshness, leg-mismatch behaviour, startup-fetch flags.
+Single dataclass holding the connection + startup tunables.
 
 ### `IBKRConfig`
 
@@ -51,16 +56,8 @@ quote-freshness, leg-mismatch behaviour, startup-fetch flags.
 | `readonly` | `False` | True blocks order submission at the API level |
 | `account` | `""` | Specific account when the session has multiple |
 | `connect_timeout` | `10.0` | Seconds for `connectAsync` to complete |
-| `request_timeout` | `30.0` | Default per-request timeout |
-| `reconnect_base_delay` | `2.0` | Doubles each attempt |
-| `reconnect_max_delay` | `120.0` | Cap on backoff |
-| `reconnect_max_attempts` | `0` | 0 = retry forever |
-| `watchdog_interval` | `30.0` | Ping cadence |
-| `watchdog_enabled` | `True` | Detect silent half-open sockets |
-| `quote_max_age_s` | `5.0` | Drop option quotes older than this |
-| `stale_quote_circuit_break` | `5` | Polls before strategies escalate |
-| `auto_flatten_on_mismatch` | `True` | Flatten orphan legs on `LegMismatch` (when wired by caller) |
-| `fetch_fields` | `POSITIONS \| ORDERS_OPEN \| ORDERS_COMPLETE \| ACCOUNT_UPDATES \| EXECUTIONS` | Startup state to pre-fetch |
+| `request_timeout` | `30.0` | Default per-request timeout (`ib.RequestTimeout`) |
+| `fetch_fields` | `POSITIONS \| ORDERS_OPEN \| ORDERS_COMPLETE \| ACCOUNT_UPDATES \| EXECUTIONS` | `StartupFetch` bitmask of data to pull on connect |
 
 Pure data; no I/O on construction.
 
@@ -68,9 +65,9 @@ Pure data; no I/O on construction.
 
 ## `ibtws.unofficial._pacing`
 
-Shared concurrency + rate-limit primitive. Both `OrderManager` and
-`OptionChainFetcher` accept an `executor` so a single bucket can govern the
-aggregate request rate (keeping the session under IB's ~50 msg/s ceiling).
+Shared concurrency + rate-limit primitive. `OrderManager` accepts an
+`executor` so a single bucket can govern the aggregate request rate (keeping the
+session under IB's ~50 msg/s ceiling).
 
 ### `ThrottledExecutor`
 
@@ -87,7 +84,7 @@ ThrottledExecutor(*, max_concurrency: int, pace_per_sec: float)
 | `min_interval` (property) | Seconds between slot acquisitions; 0 when pacing off |
 
 ```python
-executor = ThrottledExecutor(max_concurrency=25, pace_per_sec=40.0)
+executor = ThrottledExecutor(max_concurrency=10, pace_per_sec=10.0)
 async with executor.slot():
     await ib.reqTickersAsync(...)
 ```
@@ -96,24 +93,15 @@ Pacing bucket is `asyncio.Lock`-protected; safe to share across coroutines.
 
 ---
 
-## `ibtws.unofficial._ib_errors`
+## `ibtws.unofficial.helpers`
 
-Maps raw IBKR numeric codes into actionable buckets so callers can react
-differently to pacing vs connection vs market-data vs order errors.
+Small stateless utilities shared across the unofficial layer.
 
-### `ErrorCategory` (str Enum)
-
-`CONNECTION`, `MARKET_DATA`, `ORDER`, `PACING`, `INFO`, `UNKNOWN`.
-
-### `classify(error_code: int) -> ErrorCategory`
-
-- Specific codes win over ranges (e.g. `100` → `PACING`, `354` → `MARKET_DATA`, `1100` → `CONNECTION`, `2104` → `INFO`).
-- Range fallbacks: `1100–1300` = `CONNECTION`, `2100–2200` = `INFO`,
-  `300–399` = `MARKET_DATA`, `200–299` / `400–499` = `ORDER`.
-- Anything else → `UNKNOWN`.
-
-Pure lookup, no state. Reference:
-<https://interactivebrokers.github.io/tws-api/message_codes.html>.
+| Function | Purpose |
+|---|---|
+| `safe_pick_value(obj, attr, *, allow_negative=False) -> float \| None` | Read a numeric attribute, scrubbing IB's `-1` / NaN "no data" sentinels. Pass `allow_negative=True` for fields that are legitimately negative (delta, theta) |
+| `calc_dte(expiration) -> float` | Calendar days from today to a `YYYYMMDD` expiration (floored at 0) |
+| `chunked(seq, size)` | Yield successive `size`-length slices of a sequence |
 
 ---
 
@@ -121,50 +109,35 @@ Pure lookup, no state. Reference:
 
 ### `IBKRClient`
 
-Lifecycle wrapper around `ib_async.IB` with auto-reconnect, watchdog and
-structured error logging. Raw `IB` instance exposed as `.ib` for direct use
-of the full ib_async API.
+Thin lifecycle wrapper around `ib_async.IB`. The raw `IB` instance is exposed
+as `.ib` for direct use of the full ib_async API. Applies
+`config.request_timeout` and sets `RaiseRequestErrors = True` at construction.
+No network I/O at construction.
 
 ```python
-IBKRClient(
-    config: IBKRConfig,
-    *,
-    on_connected:    Callable[[IBKRClient], None] | None = None,
-    on_disconnected: Callable[[IBKRClient], None] | None = None,
-    on_error:        Callable[[int, int, str, str], None] | None = None,
-)
+IBKRClient(config: IBKRConfig)
 ```
-
-Hooks run on the event-loop thread; exceptions are logged and swallowed so
-they cannot break the lifecycle. No network I/O at construction.
 
 | Method | Purpose |
 |---|---|
-| `is_connected` (property) | Pass-through to `ib.isConnected()` |
-| `async connect()` | Open socket + complete startup sync. Raises `ConnectionError` (chains `__cause__`) |
-| `async disconnect()` | Idempotent. Sets `_shutting_down` *first* so the sync `disconnectedEvent` won't schedule a new reconnect. Cancels and awaits watchdog/reconnect tasks before closing |
-| `async qualify(*contracts) -> list[Contract]` | Wraps `qualifyContractsAsync`; raises `ValueError` on length mismatch or missing `conId` |
-| `async __aenter__/__aexit__` | Context manager does NOT auto-connect. `__aexit__` always calls `disconnect()` |
-| `run_sync(coro)` | Spins up a fresh event loop, connects, runs `coro`, disconnects in `finally`. Do not call inside an existing loop |
+| `async connect()` | Idempotent. Opens the socket via `connectAsync` using the config (host/port/clientId/timeout/readonly/account/fetchFields) |
+| `async disconnect()` | Idempotent — no-op when already disconnected |
+| `async get_market_data(contract) -> Ticker` | Qualify, `reqMktData` (generic ticks `100,101,104,106`), settle ~1 s, snapshot via `reqTickersAsync`, cancel. Raises `LookupError` if no ticker returned |
+| `async get_historical_data(contract, duration, bar_size, *, use_rth=True, end_datetime=None, what_to_show="TRADES") -> pd.DataFrame` | Qualify + `reqHistoricalDataAsync`. Returns a DataFrame (empty when IB returns nothing) |
+| `async __aenter__` / `__aexit__` | Context manager. **`__aenter__` calls `connect()`**; `__aexit__` always calls `disconnect()` |
 
-**Reconnect:** delay doubles each attempt up to `reconnect_max_delay`, with
-±10 % jitter. Resets counter on success. Honours `reconnect_max_attempts`
-(0 = forever).
-
-**Watchdog:** pings via `reqCurrentTimeAsync` every `watchdog_interval`
-with a fixed 10 s timeout. On failure: forces `ib.disconnect()` so the
-disconnect handler will reconnect — catches NAT timeouts and half-open
-sockets that don't fire `disconnectedEvent`.
-
-**Errors:** every `errorEvent` is routed through `classify()` and logged at
-a level appropriate to the category (DEBUG for INFO, WARNING for
-CONNECTION/MARKET_DATA/PACING, ERROR for ORDER and unknown).
+`BarSize` and `Duration` are `Literal` string types enumerating the values IB's
+`reqHistoricalData` accepts (any `"<int> <S|D|W|M|Y>"` duration is also valid).
 
 ```python
-async with IBKRClient(cfg) as client:
-    await client.connect()
-    positions = await client.ib.reqPositionsAsync()
+async with IBKRClient(cfg) as client:            # auto-connects
+    client.ib.reqMarketDataType(2)               # 1 live, 2 frozen, 3 delayed
+    ticker = await client.get_market_data(contract)
+    bars = await client.get_historical_data(contract, "1 D", "5 mins")
 ```
+
+> Note: calling `await client.connect()` inside an `async with` block is
+> harmless (idempotent), which is why several examples do both.
 
 ---
 
@@ -182,42 +155,39 @@ Public re-exports: `ChainDefinition`, `OptionQuote`, `OptionChainFetcher`,
   `bid/ask/volume/open_interest`, greeks `iv/delta/gamma/vega/theta`,
   `underlying_price`, `timestamp`. Every metric is `Optional[float]`;
   `None` means "IB returned no data" — never silently coerced to 0.
+- **`IVRankResult`** (frozen) — see `option.iv_rank` below.
 
 ### `option.utils`
 
 | Public helper | Purpose |
 |---|---|
-| `is_quote_fresh(ticker, max_age_s, *, now=None) -> bool` | True iff ticker's timestamp is within `max_age_s` of `now`. Missing timestamp → not fresh. `max_age_s<=0` disables (always True) |
-| `quotes_to_dataframe(quotes) -> pd.DataFrame` | Flatten quotes; returns empty DataFrame with `DATAFRAME_COLUMNS` when input empty |
-| `DATAFRAME_COLUMNS` | Canonical column order |
+| `quotes_to_dataframe(quotes) -> pd.DataFrame` | Flatten quotes; returns an empty DataFrame with `DATAFRAME_COLUMNS` when input is empty, so downstream `df["strike"]` / `df.empty` checks always work |
+| `DATAFRAME_COLUMNS` | Canonical column order for the projection |
+
+Internal helpers (`_filter_expirations`, `_filter_strikes`, `_ticker_to_quote`)
+back `fetch_snapshot`.
 
 ### `option.chains.OptionChainFetcher`
 
 Throttled, fault-tolerant snapshot fetcher built on `IBKRClient`. Does NOT
-own the connection — caller handles `connect()` / `disconnect()`.
+own the connection — the caller handles `connect()` / `disconnect()`.
 
 ```python
-OptionChainFetcher(
-    client: IBKRClient,
-    *,
-    max_concurrency:   int = 25,
-    pace_per_sec:      float = 40.0,
-    snapshot_timeout:  float = 20.0,
-    quote_max_age_s:   float = 0.0,   # >0 enables the freshness filter
-    executor:          ThrottledExecutor | None = None,
-)
+OptionChainFetcher(client: IBKRClient)
 ```
 
 | Method | Purpose |
 |---|---|
-| `async fetch_chain_definition(underlying, *, exchange="SMART", trading_class=None) -> ChainDefinition` | Returns the (expirations × strikes) universe for one underlying. Raises `ValueError` if unqualified, `LookupError` if no params match |
-| `async fetch_snapshot(underlying, *, rights=("C","P"), expirations=None, expiry_from/to=None, strikes=None, strike_from/to=None, strike_window_pct=0.2, batch_size=50, as_dataframe=False, ...) -> list[OptionQuote] \| DataFrame` | Resolve + quote a slice of the chain. **Fault-tolerant**: qualify or snapshot failures are logged at WARNING and excluded — caller always gets a partial answer. Auto-windows strikes around spot when no explicit strikes given |
-| `release(contracts) -> int` | Cancel `reqMktData` subscriptions opened by previous snapshots. Returns count actually cancelled. **Important** — IB caps simultaneous market-data lines (~100); long-running strategies must release to avoid exhausting the quota |
-| `subscribed_count` (property) | Number of contracts currently subscribed |
+| `async fetch_chain_definition(underlying, *, exchange="SMART", trading_class=None) -> ChainDefinition` | Returns the (expirations × strikes) universe for one underlying. Raises `ValueError` if the underlying is unqualified, `LookupError` if no option params match |
+| `async fetch_snapshot(underlying, *, exchange="SMART", currency="USD", trading_class=None, rights=("C","P"), expirations=None, expiry_from/to=None, strikes=None, strike_from/to=None, strike_window_pct=0.2, batch_size=100, as_dataframe=False) -> list[OptionQuote] \| DataFrame` | Resolve + quote a slice of the chain. **Fault-tolerant**: qualify or snapshot failures are logged at WARNING and excluded, so the caller always gets a partial answer. Auto-windows strikes around spot (`strike_window_pct`) when no explicit strikes are given |
 
-Quotes older than `quote_max_age_s` are dropped before returning (DEBUG log
-of the dropped count). Backwards-compat shims (`_min_interval`,
-`_await_next_slot`, `_slot`) delegate to the executor.
+Selection precedence for both expirations and strikes: an explicit whitelist
+(`expirations=` / `strikes=`) wins over an inclusive range (`*_from` / `*_to`).
+Quotes with no `bid`, `ask` and `iv` are dropped before returning.
+
+Market-data subscriptions are opened and cancelled inside each snapshot batch
+(subscribe → settle 0.2 s → `reqTickersAsync` → cancel), so no long-lived
+subscriptions are leaked.
 
 ### `option.iv_rank.IVRankCalculator`
 
@@ -228,14 +198,16 @@ IVRankCalculator(client, *, request_timeout=60.0)
 async calculate(underlying, *, lookback_days=252, end_datetime="", use_rth=True) -> IVRankResult
 ```
 
-`IVRankResult` fields: `current_iv`, `min_iv`, `max_iv`, `iv_rank` (0–100
-or `None`), `iv_percentile` (0–100 or `None`), `sample_size`, `lookback_days`,
-`as_of`, `underlying_symbol`.
+`IVRankResult` fields: `underlying_symbol`, `as_of`, `current_iv`, `min_iv`,
+`max_iv`, `iv_rank` (0–100 or `None`), `iv_percentile` (0–100 or `None`),
+`sample_size`, `lookback_days`.
 
-- `iv_rank` is `None` when max == min (degenerate window).
-- `iv_percentile` is `None` for single-bar history (never silently 0).
-- Percentile excludes the current bar (strictly-below over history).
-- Failed history requests are logged and treated as empty (all-None result).
+- `iv_rank = (current − min) / (max − min) × 100`; `None` when max == min
+  (degenerate flat window).
+- `iv_percentile` = share of *historical* observations strictly below current,
+  excluding the current bar; `None` for single-bar history (never silently 0).
+- Failed history requests are logged and treated as empty (all-`None` result).
+- The underlying is qualified on the fly when `conId` is missing.
 
 ---
 
@@ -257,6 +229,7 @@ flattener used everywhere events touch disk.
 
 **Frozen request dataclasses.** `MarketRequest`, `LimitRequest`,
 `StopRequest`, `BracketRequest` (entry + TP, plus optional OCA-grouped SL).
+All carry `contract`, `side`, `quantity`, `tif`, `account`, `outside_rth`.
 
 **Runtime.**
 - `TrackedOrder` (mutable) — live view of one submitted order, kept in sync
@@ -270,7 +243,7 @@ flattener used everywhere events touch disk.
 `RequestSubmitted`, `StatusChanged`, `Filled`, `Cancelled`, `Rejected`,
 `PositionChanged`, `LegMismatch`. Unioned as `OrderEvent`.
 
-`event_from_dict(data)` reverses `to_dict()`; raises `ValueError` on unknown
+`event_from_dict(data)` reverses `to_dict()`; raises `ValueError` on an unknown
 discriminator.
 
 ### `order.factory`
@@ -292,8 +265,8 @@ them into raw `ib_async.Order` objects.
 | Function | Purpose |
 |---|---|
 | `make_order_ref() -> str` | 32-char hex UUID used as `orderRef` |
-| `is_paper_account(account_id) -> bool` | True iff starts with `DU` |
-| `validate_request(request) -> None` | Raises `ValueError` with a precise message. Rejects: unsupported type, missing contract, unqualified non-BAG contract, non-`OrderSide`, non-positive qty, non-positive limit/stop/TP/SL (BAG combo limits are allowed signed/zero/negative since they encode net credit), bracket TP/SL geometry inconsistent with side |
+| `is_paper_account(account_id) -> bool` | True iff it starts with `DU` |
+| `validate_request(request) -> None` | Raises `ValueError` with a precise message. Rejects: unsupported type, missing contract, unqualified non-BAG contract, non-`OrderSide`, non-positive qty, non-positive limit/stop/TP/SL (BAG combo limits are allowed signed/zero/negative since they encode net credit), bracket TP/SL geometry inconsistent with side. A BAG contract is accepted iff every `comboLeg` carries a non-zero `conId` |
 
 ### `order.store`
 
@@ -311,8 +284,8 @@ Append-only JSONL audit log.
 | `async append(event)` | Serialise, write, flush, optional `os.fsync`. Under `asyncio.Lock` |
 | `replay() -> Iterator[OrderEvent]` | Stream events back from disk. Missing file = empty iterator (no error). Raises `ValueError` with `path:line_no` on corruption |
 
-Parent directory must exist; file is created on first append.
-`fsync=False` is ~10× faster but loses crash-safety — fine for tests.
+Parent directory must exist; the file is created on first append.
+`fsync=False` is ~10× faster but loses kernel-crash safety — fine for tests.
 Recovery model is pure replay; the file is never rewritten or truncated.
 
 ### `order.monitor`
@@ -321,9 +294,9 @@ Fan-out event bus. Supports both async-iterator and sync-callback styles.
 
 | Method | Purpose |
 |---|---|
-| `publish(event)` | Enqueue and fire registered callbacks. Callback exceptions logged + swallowed — one bad subscriber cannot poison the bus |
+| `publish(event)` | Enqueue and fire registered callbacks. Callback exceptions are logged + swallowed — one bad subscriber cannot poison the bus |
 | `async stream() -> AsyncIterator[OrderEvent]` | Backpressure-friendly queue consumer |
-| `register(fn)` / `unregister(fn)` | Sync inline callback |
+| `register(fn)` / `unregister(fn)` | Sync inline callback (un)registration |
 
 ### `order.reconciler`
 
@@ -332,8 +305,8 @@ async reconcile(client, store) -> ReconciliationReport
 ```
 
 Startup divergence diff between IB (source of truth) and the local audit
-log. Never mutates IB or store. Logs WARNINGs on `local_only` (we
-thought we had it, IB doesn't) and `ib_only` (IB has an open order that we
+log. Never mutates IB or the store. Logs WARNINGs on `local_only` (we
+thought we had it, IB doesn't) and `ib_only` (IB has an open order we
 never persisted — e.g. placed from TWS directly).
 
 `ReconciliationReport` (frozen): `matched: list[str]`, `local_only:
@@ -362,15 +335,15 @@ OrderManager(
 
 | Method | Behaviour |
 |---|---|
-| `async start() -> ReconciliationReport` | Binds IB events; raises `RuntimeError` if `managedAccounts` empty or primary account is live without `allow_live=True`. Rehydrates `TrackedOrder` for UUIDs that matched the reconciler. Seeds position cache + live `Contract` refs |
-| `async stop()` | Unbinds IB events. Idempotent |
+| `async start() -> ReconciliationReport` | Binds IB events; raises `RuntimeError` if `managedAccounts` is empty or the primary account is live without `allow_live=True`. Rehydrates `TrackedOrder` for UUIDs that matched the reconciler. Seeds the position cache + live `Contract` refs. Starts the background persist worker |
+| `async stop()` | Unbinds IB events, drains the persist queue, cancels the worker. Idempotent |
 
 #### Placement (persist-first)
 
 | Method | Notes |
 |---|---|
 | `async place(request) -> TrackedOrder` | Persists `RequestSubmitted` **before** `placeOrder`. Per-UUID `asyncio.Lock` guards mutations |
-| `async place_bracket(request) -> [parent, tp, sl]` | Three orders, shared `bracket_group` |
+| `async place_bracket(request) -> [parent, tp(, sl)]` | Shared `bracket_group`; two orders for TP-only, three with SL |
 | `async market(...)` / `limit(...)` / `stop_order(...)` / `bracket(...)` | One-call build + place |
 
 `stop_order` is named to avoid shadowing the `stop()` lifecycle method.
@@ -379,10 +352,10 @@ OrderManager(
 
 | Method | Notes |
 |---|---|
-| `async close_position(con_id, *, kind="market", limit_price=None, cancel_working=True) -> TrackedOrder \| None` | Cancels working orders on same contract first; qualifies and backfills empty exchange; submits opposite-side order. Returns `None` for missing/zero position |
+| `async close_position(con_id, *, kind="market", limit_price=None, cancel_working=True) -> TrackedOrder \| None` | Cancels working orders on the same contract first; qualifies and backfills an empty exchange; submits an opposite-side order. Returns `None` for a missing/zero position |
 | `async refresh_positions() -> list[PositionChanged]` | Pull fresh from IB (positionEvent can lag — always refresh before flattening) |
 | `async close_all_positions(*, kind="market", cancel_working=True) -> list[TrackedOrder]` | Refreshes then flattens every non-zero position |
-| `async cancel(uuid)` | Idempotent. `KeyError` for unknown uuid |
+| `async cancel(uuid)` | Idempotent. `KeyError` for an unknown uuid |
 | `async cancel_all() -> list[str]` | Skips terminal orders |
 
 #### Read-only views
@@ -399,19 +372,123 @@ OrderManager(
 
 - **Persist-first** — `RequestSubmitted` hits the store before `placeOrder`,
   so a crash between persist and submit is detectable by the reconciler
-  (local_only entry that IB never saw → we know we never sent it).
-- **Paper interlock** — refuses live primary account unless `allow_live=True`;
+  (a `local_only` entry that IB never saw → you know it was never sent).
+- **Paper interlock** — refuses a live primary account unless `allow_live=True`;
   `_check_account_safety` polices per-request `account` against
   `managedAccounts` (also blocks live sub-accounts on paper-primary FA setups).
-- **Exec dedup** — `_seen_exec_ids` set drops replayed `execDetails` after
+- **Exec dedup** — `_seen_exec_ids` drops replayed `execDetails` after a
   reconnect so downstream TP/SL logic doesn't double-fire.
-- **Status mapping** — `PendingCancel` → SUBMITTED (still live until a
-  terminal state arrives). `Inactive` → emits `Rejected` and flips state
-  to REJECTED.
-- **Persist failures logged, not raised** (`_persist_safely`) — the event
-  bus still gets the publish even if disk I/O fails.
-- **Concurrency / pacing** — single `ThrottledExecutor`. Pass an `executor`
-  shared with the option fetcher to govern aggregate rate.
+- **Status mapping** — `PendingCancel` / `PreSubmitted` → SUBMITTED (still live
+  until a terminal state arrives). `Inactive` → emits `Rejected` and flips
+  state to REJECTED.
+- **Persist failures logged, not raised** — the persist worker logs and
+  continues, so the event bus still publishes even if disk I/O fails.
+- **Concurrency / pacing** — a single `ThrottledExecutor`. Pass a shared
+  `executor` to govern the aggregate request rate across subsystems.
+
+---
+
+## `ibtws.unofficial.analysis`
+
+Pure analytics over DataFrames (pandas / numpy / scipy). No `ib_async`
+dependency — feed these the DataFrame from
+`option.utils.quotes_to_dataframe` (or any equivalently-shaped frame) and a
+VIX/price series. Trivially unit-testable.
+
+### `analysis.gex.GexCalculator`
+
+Gamma Exposure (GEX) calculator using Black-Scholes repricing.
+
+```python
+GexCalculator(*, risk_free_rate=0.045, sweep_points=500, bar_width=4.0)
+compute(df: pd.DataFrame) -> GexResult
+```
+
+Required DataFrame columns: `strike`, `right`, `gamma`, `open_interest`,
+`underlying_price`, `iv`, `expiry`, `timestamp`.
+
+| Member | Purpose |
+|---|---|
+| `compute(df)` | Runs the full pipeline: per-strike net GEX, BS repricing sweep, Zero Gamma Level via Brent root-finding, call/put walls, 25-delta skew. Returns and caches a `GexResult` |
+| `summary()` | Formatted multi-line summary string (also prints). Raises if `compute()` wasn't called |
+| `plot(save_path=None, title_suffix="") -> bytes` | Render the combined profile + histogram chart; returns PNG bytes. Saves to `save_path` when given |
+| `zero_gamma_level` / `regime` / `total_gex` (properties) | Convenience accessors on the cached result |
+
+`GexResult` (dataclass) carries `spot`, `zero_gamma_level`, `regime`
+(`"POSITIVE"`/`"NEGATIVE"`), `pts_from_zgl`, `total_gex`, `call_gex`,
+`put_gex`, `call_wall`, `put_wall`, `all_crossings`, sweep arrays, the
+per-strike net-GEX frame, and optional `skew` / `skew_ratio`.
+
+`_derive_params` treats expiry as the **4pm (22:00 UTC) close** on the expiry
+date and raises `ValueError` on non-positive time-to-expiry — critical for 0DTE
+where midnight vs. close flips the sign of `T`.
+
+### `analysis.expected_move.ExpectedMoveCalculator`
+
+Expected-move estimate from an option-chain DataFrame via two methods.
+
+```python
+ExpectedMoveCalculator().calculate(df: pd.DataFrame) -> ExpectedMoveResult
+```
+
+Required columns: `strike`, `right`, `bid`, `ask`, `iv`, `underlying_price`,
+`expiry` (optional `symbol`). Raises `ValueError` on an empty frame or missing
+columns/data.
+
+Methods combined:
+1. **ATM straddle** — ATM call mid + ATM put mid.
+2. **IV-based 1σ** — `spot × IV × √(DTE/365)` from the average ATM IV.
+
+`ExpectedMoveResult` (frozen): `underlying_symbol`, `spot`, `expiration`,
+`straddle_move`/`straddle_pct`, `iv_move`/`iv_pct`/`atm_iv`, and `avg_move`
+(average of the two methods; `None` unless both are available). Every derived
+metric is `None` when its inputs are unavailable — never silently zero.
+
+### `analysis.market_bias.determine_market_bias`
+
+```python
+determine_market_bias(market_data: pd.DataFrame | None, *, fast_window=5, slow_window=10, volume_window=20) -> dict
+```
+
+Classifies directional bias from `close` prices using fast/slow moving
+averages. Returns a `{"bias": ..., "details": {...}}` dict where `bias` is
+`"bullish"`, `"bearish"`, `"neutral"`, or the sentinel `"!neutral"`.
+
+- A directional bias is reported **only when trend (fast MA vs slow MA) and
+  momentum (last close vs slow MA) agree** and are non-neutral — a deliberate
+  confirmation filter against choppy-market crossovers.
+- `"!neutral"` signals a *data* problem (no data, insufficient rows, missing
+  `close` column, or NaN in the evaluated window) so callers can distinguish
+  "flat market" from "cannot tell".
+- Raises `ValueError` for misconfigured windows (non-positive, or
+  `fast_window >= slow_window`) — a caller programming error, distinct from a
+  data problem.
+
+### `analysis.volatility_risk.common_volatility_risk`
+
+```python
+common_volatility_risk(vix_series, vx1d_current, vix3m_current=None,
+                       lookback_days=20, risk_threshold=50, debug=False) -> dict
+```
+
+Pre-market volatility-risk score on a 0–100 scale for short-premium / 0DTE
+gating, from four components:
+
+| Component | Range | Signal |
+|---|---|---|
+| VIX deviation | 0–35 | z-score vs a rolling window (+ momentum adjustment) |
+| VX1D / VIX ratio | 0–25 | intraday vs 30-day implied vol |
+| Absolute VIX | 0–20 | raw level of fear |
+| Term structure | 0–20 | VIX slope vs VIX3M (skipped when `vix3m_current` is `None`) |
+
+Returns `decision` (`"TRADE"` / `"NO TRADE"` against `risk_threshold`),
+`risk_score`, `risk_threshold`, `overall_structure` (human-readable flags),
+`component_scores`, and — when `debug=True` — a `metrics` dict of raw values.
+
+**Fails loud**: raises `ValueError` when `vix_series` is too short, contains
+NaN in the scoring window, or when any current VIX / VIX1D / VIX3M input is
+non-positive or non-finite. A trade gate should treat bad data as a hard block
+(fail-closed), not receive a silently maxed-out score.
 
 ---
 
@@ -441,17 +518,17 @@ interlock, and the event stream uniformly with single-leg orders.
 
 | Knob | Default | Purpose |
 |---|---|---|
-| `target_short_delta` | `0.30` | `|Δ|` target for short leg |
+| `target_short_delta` | `0.30` | `\|Δ\|` target for the short leg |
 | `wing_width` | `5.0` | Strike distance ($) — selector snaps to nearest available |
 | `target_dte` / `dte_tolerance` | `30` / `14` | Pick expiry closest to target within tolerance |
-| `max_short_delta` | `0.50` | Hard cap on chosen short `|Δ|`; `None` to disable |
-| `min_credit` / `min_credit_width_ratio` | `None` / `None` | Economic floors |
+| `max_short_delta` | `0.50` | Hard cap on chosen short `\|Δ\|`; `None` to disable |
 | `min_open_interest` / `min_volume` | `0` / `0` | Liquidity filters (legs with `None` are kept) |
+| `min_credit` / `min_credit_width_ratio` | `None` / `None` | Economic floors |
 | `quantity` | `1` | Number of spreads |
 | `limit_slippage` | `0.05` | Fraction below mid the entry limit can sit |
+| `tif` / `account` / `outside_rth` | DAY / `None` / `False` | Order knobs |
 | `take_profit_pct` | `0.5` | Close at 50 % of credit captured |
 | `stop_loss_multiplier` | `2.0` | Close on loss = N × credit (capped at width) |
-| `tif` / `account` / `outside_rth` | DAY / `None` / `False` | Order knobs |
 | `exchange` / `currency` / `trading_class` | `"SMART"` / `"USD"` / `None` | Universe selector (e.g. `"SPXW"` for PM-settled SPX dailies) |
 | `expirations` / `expiry_from` / `expiry_to` | `None` | Pre-filters on the chain |
 | `strike_window_pct` | `0.10` | ±10 % of spot bounds the snapshot |
@@ -461,8 +538,8 @@ interlock, and the event stream uniformly with single-leg orders.
 | Function | Behaviour |
 |---|---|
 | `select_expiry(expirations, *, target_dte, dte_tolerance, now=None) -> str` | Closest expiry inside tolerance; raises `CreditSpreadError` if none qualifies. Ignores negative-DTE entries |
-| `select_short_leg(quotes, *, target_short_delta, max_short_delta, min_open_interest, min_volume) -> OptionQuote` | Tradeability filter + closest `|Δ|`. Rejects if max-delta ceiling leaves nothing |
-| `select_long_leg(quotes, *, short, wing_width, spread_type, ...) -> OptionQuote` | Snaps to nearest strike at or beyond requested width on the protective side. Refuses widths < 50 % of requested (chain too narrow) |
+| `select_short_leg(quotes, *, target_short_delta, max_short_delta, min_open_interest, min_volume) -> OptionQuote` | Tradeability filter + closest `\|Δ\|`. Rejects if the max-delta ceiling leaves nothing |
+| `select_long_leg(quotes, *, short, wing_width, spread_type, ...) -> OptionQuote` | Snaps to the nearest strike at or beyond the requested width on the protective side. Refuses widths < 50 % of requested (chain too narrow) |
 
 #### `CreditSpreadStrategy`
 
@@ -476,11 +553,13 @@ CreditSpreadStrategy(
 )
 ```
 
+`order_manager` is required — combo placement always goes through it.
+
 | Method | Purpose |
 |---|---|
-| `async build_plan(params) -> CreditSpreadPlan` | Qualify underlying → fetch chain → pick expiry → snapshot relevant right → select legs → enforce economic constraints |
-| `async place(plan, *, limit_credit=None) -> TrackedOrder` | Submits as `BUY @ -credit` signed combo limit via `OrderManager.limit`. Rounds to tick |
-| `async close(plan, *, limit_debit=None, tif=None) -> TrackedOrder` | BUY-back BAG limit. **Releases the two market-data subscriptions in `finally`** to free IB quota |
+| `async build_plan(params) -> CreditSpreadPlan` | Qualify underlying → fetch chain → pick expiry → snapshot the relevant right → select legs → enforce economic constraints |
+| `async place(plan, *, limit_credit=None) -> TrackedOrder` | Submits as `BUY @ -credit` signed combo limit via `OrderManager.limit`. Rounds to tick; refuses a non-positive credit |
+| `async close(plan, *, limit_debit=None, tif=None) -> TrackedOrder` | Buy-back the BAG (`SELL @ -debit`). Derives the debit from `take_profit_debit` or a live re-quote when not supplied |
 | `async monitor_and_exit(plan, entry, *, poll_interval=15.0, max_wait=None) -> TrackedOrder \| None` | Wait for entry fill, poll mid-debit, fire close on TP / SL. Tolerates quote drop-outs (continues polling). Returns `None` on timeout or pre-fill cancel |
 
 #### Combo sign convention
@@ -493,10 +572,9 @@ directions live in `plan.bag.comboLegs` (SELL short, BUY long).
 
 ```python
 async with IBKRClient(cfg) as client:
-    await client.connect()
     om = OrderManager(client, JsonStore("orders.jsonl"))
     await om.start()
-    fetcher = OptionChainFetcher(client, quote_max_age_s=5.0)
+    fetcher = OptionChainFetcher(client)
     strat = CreditSpreadStrategy(client, om, fetcher=fetcher)
 
     plan = await strat.build_plan(
@@ -506,6 +584,7 @@ async with IBKRClient(cfg) as client:
             target_short_delta=0.10,
             wing_width=10.0,
             target_dte=0,
+            trading_class="SPXW",
         )
     )
     tracked = await strat.place(plan)
@@ -514,49 +593,32 @@ async with IBKRClient(cfg) as client:
 
 ---
 
-## `ibtws.official`
-
-`official/client.py` is a placeholder. No public surface yet — reserved for
-a future officially-sanctioned client. Use `ibtws.unofficial.*` for all
-real work.
-
----
-
 ## Cross-cutting design notes
 
 ### Persistence model — pure replay
 `JsonStore` is append-only. There is no UPDATE / DELETE / query — recovery
-is `replay()` then fold to current state. This means corruption is
-detectable (replay raises on bad line) and writes are crash-safe under
-`fsync=True`.
+is `replay()` then fold to current state. Corruption is detectable (replay
+raises on a bad line) and writes are crash-safe under `fsync=True`.
 
 ### Persist-first ordering
 `OrderManager` always persists `RequestSubmitted` **before** calling
 `placeOrder`. A crash in the window between persist and submit leaves a
-local entry the reconciler will classify as `local_only` — you know the
-order was never sent, and can decide whether to re-submit or drop it.
+local entry the reconciler classifies as `local_only` — you know the order
+was never sent and can decide whether to re-submit or drop it.
 
 ### Idempotency
 - `cancel(uuid)` — terminal orders are a no-op (warn-log).
-- `disconnect()` — safe to call multiple times.
+- `connect()` / `disconnect()` — safe to call multiple times.
 - `JsonStore.replay()` — pure read, no side effects.
-- `OptionChainFetcher.release()` — unknown contracts silently ignored.
 
 ### Fault tolerance
 - `fetch_snapshot` — failed qualify or snapshot batches are logged at
-  WARNING and excluded. Caller always gets a partial answer.
-- `_persist_safely` — store failures are logged, never raised, so the event
+  WARNING and excluded; the caller always gets a partial answer.
+- The persist worker logs store failures instead of raising, so the event
   bus still publishes.
-- `_handle_error` — IB error codes never crash the client; they route
-  through `classify()` and pick an appropriate log level.
+- `current_pnl` — a missing quote yields `None` fields, never a fabricated 0.
 
 ### Rate limiting
-A single `ThrottledExecutor` can be shared between `OrderManager` and
-`OptionChainFetcher` so the aggregate request rate respects IB's ~50 msg/s
-ceiling. Each subsystem can still own its own concurrency cap.
-
-### Market-data subscription quota
-IB caps simultaneous market-data lines (~100 / session). Long-running
-strategies that build and close many spreads must call
-`fetcher.release(contracts)` after a position is closed.
-`CreditSpreadStrategy.close()` does this automatically in `finally`.
+A single `ThrottledExecutor` (semaphore + monotonic token bucket) governs the
+order path (default 10 msg/s, 10 concurrent). Pass a shared `executor` to keep
+the aggregate session rate under IB's ~50 msg/s ceiling.
