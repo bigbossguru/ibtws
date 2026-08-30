@@ -30,7 +30,8 @@ ibtws/
     │   ├── gex.py                # GexCalculator — gamma exposure profile
     │   ├── expected_move.py      # ExpectedMoveCalculator
     │   ├── market_bias.py        # determine_market_bias
-    │   └── volatility_risk.py    # common_volatility_risk
+    │   ├── volatility_risk.py    # common_volatility_risk
+    │   └── volatility_regime.py  # detect_volatility_regime — 0DTE tail-regime gate
     └── strategies/
         └── credit_spread.py      # vertical credit-spread strategy (BAG combo)
 ```
@@ -489,6 +490,80 @@ Returns `decision` (`"TRADE"` / `"NO TRADE"` against `risk_threshold`),
 NaN in the scoring window, or when any current VIX / VIX1D / VIX3M input is
 non-positive or non-finite. A trade gate should treat bad data as a hard block
 (fail-closed), not receive a silently maxed-out score.
+
+### `analysis.volatility_regime.detect_volatility_regime`
+
+```python
+detect_volatility_regime(*, vix1d_open, vix1d_history, vix_open, vix_prev_close,
+                         spx_closes, spx_price, zero_gamma_level,
+                         vix_history=None, zgl_source=None,
+                         config=DEFAULT_CONFIG) -> VolatilityRegimeResult
+```
+
+Pre-market regime gate for 0DTE SPX credit spreads / iron condors, implementing
+`analysis/VOLATILITY_REGIME_CONCEPT.md` (v2). It is a **tail-regime cut-off, not
+a good-day selector**: expected coverage is ~88 % of days, and it makes no claim
+to improve the average outcome on the days it allows.
+
+Complementary to `common_volatility_risk`: that one produces a graded 0–100
+score, this one a binary gate with per-metric flag provenance.
+
+| Metric | Soft (≈p90) | Hard (≈p98) |
+|---|---|---|
+| `base_level` — percentile rank of `VIX1D_open` over 60 sessions | rank 90–98 | rank > 98 |
+| `vix1d_absolute` — raw VIX1D level | — | > 25 |
+| `vix_roc` — `(VIX_open − VIX_prev_close) / VIX_prev_close` | 10–15 % | > 15 % |
+| `term_structure` — `VIX1D / VIX` (normal level ≈ 0.6) | 0.85–1.00 | > 1.00 |
+| `premium_richness` — `VIX1D_open − RV20` | −10 … −6 | < −10 |
+| `gex` — signed distance from ZGL in expected moves | ±0.25 EM | < −0.25 EM |
+
+Each metric contributes at most one flag; the decision is
+`favorable = (hard == 0) and (soft <= 1)`. A low base level (`LOW`) is
+informational and never blocks — minimum-credit adequacy is an entry rule, not a
+regime question.
+
+Returns a frozen `VolatilityRegimeResult`: `favorable`, `flags`
+(`RegimeFlag(metric, severity, value, detail, missing)`), `base_rank`,
+`base_regime` (`LOW`/`NORMAL`/`HIGH`/`EXTREME`), `degraded_base`, `reason`,
+`metrics`, `zgl_source`, plus `hard_count` / `soft_count` / `missing_metrics`
+properties and a one-line `summary()`.
+
+**Fail-safe over fail-loud**: unlike the scorer, bad market data never raises —
+an unavailable metric becomes a `missing`-tagged **hard** flag (logged as
+`missing_data` rather than `risk_flag`, so infrastructure gaps stay separable in
+flag-frequency statistics). An unavailable base level short-circuits the whole
+evaluation with `reason="no_base_level"`. `ValueError` is reserved for
+`VolatilityRegimeConfig` misconfiguration, which is a caller bug.
+
+Thresholds live in the frozen `VolatilityRegimeConfig`. They are percentiles of
+the observed distributions on 500 sessions — **not** transplanted from
+equity-option practice. Preserve that property when retuning, and recheck flag
+frequencies against §3.2 of the concept as the market regime shifts.
+
+Two deliberate exclusions: the **macro calendar** (FOMC/CPI/NFP) is a separate
+hard-skip module that overrides this result, and **put/call skew** is a
+strike-selection modifier rather than a regime flag. **GEX is unvalidated** — the
+only metric resting on theory alone, since historical option chains are not
+available; treat it as a hypothesis under observation.
+
+```python
+from ibtws.unofficial.analysis.gex import GexCalculator
+from ibtws.unofficial.analysis.volatility_regime import detect_volatility_regime
+
+gex = GexCalculator().compute(chain_df)
+regime = detect_volatility_regime(
+    vix1d_open=8.4,
+    vix1d_history=vix1d_opens,      # >= 60 prior sessions, today excluded
+    vix_open=14.2,
+    vix_prev_close=14.1,
+    spx_closes=spx_daily_closes,    # >= 21 completed sessions
+    spx_price=gex.spot,
+    zero_gamma_level=gex.zero_gamma_level,
+    zgl_source="GexCalculator/ibtws",
+)
+if regime.favorable and not macro_calendar_skip(today):
+    ...  # proceed to strike selection
+```
 
 ---
 

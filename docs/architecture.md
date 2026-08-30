@@ -38,6 +38,7 @@ flowchart TB
         ExpMove[ExpectedMoveCalculator]
         Bias[determine_market_bias]
         VolRisk[common_volatility_risk]
+        VolRegime[detect_volatility_regime<br/>0DTE tail-regime gate]
     end
 
     subgraph Strategies["🎯 strategies/"]
