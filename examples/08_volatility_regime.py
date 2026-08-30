@@ -14,15 +14,15 @@ end-to-end against TWS, using only :class:`IBKRClient`:
 The connection is read-only (``IBKRConfig(readonly=True)``): this example never
 submits an order, so the interlock costs nothing and removes the possibility.
 
-Two caveats worth knowing before relying on the output:
+``Index("VIX1D", "CBOE", "USD")`` resolves on TWS, so the primary path needs no
+external data source. Two things to keep in mind about the values it returns:
 
-* **VIX1D availability at IBKR is not guaranteed.** Section 6 of the concept
-  names Cboe's ``VIX1D_History.csv`` as the source of record. If TWS has no
-  VIX1D subscription the example degrades to the VIX percentile fallback of
-  §2.1, which the detector reports as ``degraded_base=True`` and which turns
-  every VIX1D-derived metric into a missing-data hard flag. That is a correct
-  fail-safe, not a working configuration — wire ``load_index_series`` to the
-  Cboe CSV if your TWS lacks the index.
+* **Depth of history matters.** The base level is a 60-session percentile and
+  RV20 needs 21 completed sessions, so the ``6 M`` request has to come back
+  reasonably complete. A short series is reported as a data gap (hard flag)
+  rather than computed on a smaller window — if that happens, check the index
+  subscription before widening the duration. Cboe's ``VIX1D_History.csv``
+  remains the source of record per §6 and is the natural cross-check.
 * **Pre-open index values are noisy.** Cboe opens SPX/VIX option order
   acceptance at 07:30 ET, so an 08:30 ET reading exists but sits on wide
   spreads. The concept flags comparing 08:30 against post-09:30 values as
@@ -296,9 +296,10 @@ async def main() -> None:
 
         if vix1d_contract is None:
             logger.warning(
-                "VIX1D is not available on this TWS connection. The gate will fall back to the "
-                "VIX percentile (concept §2.1) and every VIX1D-derived metric becomes a "
-                "missing-data hard flag — expect SKIP. Use the Cboe VIX1D_History.csv instead."
+                "VIX1D could not be qualified on this connection, though the index does exist at "
+                "IBKR — check the market-data subscription. The gate now falls back to the VIX "
+                "percentile (concept §2.1) and every VIX1D-derived metric becomes a missing-data "
+                "hard flag, so expect SKIP."
             )
 
         # Index series first: they are cheap, and a missing base level makes the
