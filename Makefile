@@ -6,16 +6,13 @@ help:  ## Show this help messagee
 	@grep -E '^[a-zA-Z_-]+:.*?##' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-12s %s\n", $$1, $$2}'
 
 install:  ## Install the poetry environment and pre-commit hooks
-# 	@echo "📦 Initialising git submodules"
-# 	@git submodule update --init --recursive
 	@echo "🐍 Creating virtual environment and installing dependencies using poetry"
 	@poetry install --with dev
 	@poetry run pre-commit install
 
-update:  ## Pull latest code and update submodules
-	@echo "⬇️  Pulling latest code and submodules"
-	@git pull --recurse-submodules
-	@git submodule update --init --recursive
+update:  ## Pull latest code
+	@echo "⬇️  Pulling latest code"
+	@git pull
 
 check:  ## Run all code quality tools (lock check + pre-commit)
 	@echo "🔒 Checking poetry lock file consistency with pyproject.toml"

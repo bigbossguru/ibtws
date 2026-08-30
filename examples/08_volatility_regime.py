@@ -3,13 +3,13 @@
 Runs the tail-regime cut-off of ``analysis/VOLATILITY_REGIME_CONCEPT.md``
 end-to-end against TWS, using only :class:`IBKRClient`:
 
-1. ``get_historical_data`` — daily VIX1D / VIX / SPX bars for the rolling
-   windows (60-session percentile base, RV20, overnight ROC).
-2. ``get_market_data`` — today's live index opens, which the daily bars do not
-   yet carry in the first minutes of the session.
-3. ``OptionChainFetcher`` + ``GexCalculator`` — the 0DTE chain reduced to a Zero
+1. ``get_historical_data`` — daily VIX1D / VIX / SPX bars, split at the session
+   boundary into today's bar (the opens every metric of §2 is defined on) and
+   the completed sessions that feed the rolling windows (60-session percentile
+   base, RV20, overnight ROC).
+2. ``OptionChainFetcher`` + ``GexCalculator`` — the 0DTE chain reduced to a Zero
    Gamma Level.
-4. ``detect_volatility_regime`` — the gate itself.
+3. ``detect_volatility_regime`` — the gate itself.
 
 The connection is read-only (``IBKRConfig(readonly=True)``): this example never
 submits an order, so the interlock costs nothing and removes the possibility.
@@ -29,8 +29,7 @@ external data source. Two things to keep in mind about the values it returns:
   unverified (§6).
 
 The macro calendar (FOMC / CPI / NFP) has priority over this gate and is a
-separate module by design (§5); ``macro_calendar_clear`` below is an explicit
-placeholder, not an implementation.
+separate module by design (§5) and is deliberately not implemented here.
 """
 
 from __future__ import annotations
@@ -67,6 +66,19 @@ HISTORY_DURATION: Duration = "6 M"
 GEX_STRIKE_WINDOW_PCT = 0.03
 
 
+def _today_expiration() -> str:
+    """Today's date in IBKR ``YYYYMMDD`` form — the 0DTE expiration."""
+    return pd.Timestamp.now(tz=MARKET_TZ).strftime("%Y%m%d")
+
+
+def _field(bar: pd.Series | None, name: str) -> float | None:
+    """Read one price off a daily bar, tolerating an absent bar or a NaN print."""
+    if bar is None:
+        return None
+    value = bar.get(name)
+    return None if value is None or pd.isna(value) else float(value)
+
+
 async def resolve_zero_gamma_level(
     client: IBKRClient,
     underlying: Contract,
@@ -98,7 +110,6 @@ async def resolve_zero_gamma_level(
     try:
         gex = GexCalculator()
         gex.compute(quotes)
-        gex.plot("./gex.png")
     except Exception as exc:  # noqa: BLE001 - a failed sweep is a data gap for the gate
         logger.warning(f"GEX computation failed: {exc}")
         return None, None
@@ -134,6 +145,39 @@ def print_report(result: VolatilityRegimeResult) -> None:
     print()
 
 
+def _split_today(bars: pd.DataFrame) -> tuple[pd.Series | None, pd.DataFrame]:
+    """Split daily bars into ``(today_bar, completed_sessions)``.
+
+    The detector expects today excluded from every rolling window: an
+    in-progress bar in the percentile base would compare VIX1D against itself,
+    and in RV20 it would mix a partial return into the sample.
+    """
+    today = pd.Timestamp(pd.Timestamp.now(tz=MARKET_TZ).date())
+    dates = pd.to_datetime(bars["date"]).dt.normalize()
+    completed = bars[dates < today]
+    todays = bars[dates == today]
+    return (todays.iloc[-1] if not todays.empty else None), completed
+
+
+async def load_index_history(client: IBKRClient, contract: Contract) -> tuple[pd.Series | None, pd.DataFrame] | None:
+    """Load daily bars for one index, split at today's session boundary."""
+    try:
+        bars = await client.get_historical_data(
+            contract,
+            duration=HISTORY_DURATION,
+            bar_size="1 day",
+            use_rth=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - a missing index degrades the gate, it must not crash it
+        logger.warning(f"Historical bars unavailable for {contract.symbol}: {exc}")
+        return None
+
+    if bars is None or bars.empty:
+        logger.warning(f"Historical bars empty for {contract.symbol}.")
+        return None
+    return _split_today(bars)
+
+
 async def main() -> None:
     # Read-only: this example places no orders, so remove the possibility.
     config = IBKRConfig(host="192.168.0.129", port=7497, client_id=15, readonly=True)
@@ -141,36 +185,43 @@ async def main() -> None:
     async with IBKRClient(config) as client:
         client.ib.reqMarketDataType(2)
 
-        contracts = {
+        contracts: dict[str, Contract] = {
             "VIX": Index("VIX", "CBOE", "USD"),
             "VIX1D": Index("VIX1D", "CBOE", "USD"),
             "SPX": Index("SPX", "CBOE", "USD"),
         }
 
-        market_data = {}
-        historical_data = {}
+        history: dict[str, tuple[pd.Series | None, pd.DataFrame]] = {}
         for symbol, underlying in contracts.items():
-            [underlying] = await client.ib.qualifyContractsAsync(underlying)
-            contracts[symbol] = underlying
-            market_data[symbol] = await client.get_market_data(underlying)
-            historical_data[symbol] = await client.get_historical_data(
-                underlying,
-                duration="60 D",
-                bar_size="1 day",
-                use_rth=False,
-            )
+            qualified = await client.ib.qualifyContractsAsync(underlying)
+            if not qualified or qualified[0] is None:
+                logger.warning(f"Failed to qualify {symbol}; its metrics become missing-data flags.")
+                history[symbol] = (None, pd.DataFrame(columns=["open", "close"]))
+                continue
+            contracts[symbol] = qualified[0]
+            loaded = await load_index_history(client, contracts[symbol])
+            if loaded is None:
+                # A missing series becomes a missing-data hard flag downstream.
+                history[symbol] = (None, pd.DataFrame(columns=["open", "close"]))
+                continue
+            history[symbol] = loaded
 
-        spot, zgl = await resolve_zero_gamma_level(client, contracts["SPX"], "20260831")
+        vix1d_today, vix1d_past = history["VIX1D"]
+        vix_today, vix_past = history["VIX"]
+        _, spx_past = history["SPX"]
+
+        spot, zgl = await resolve_zero_gamma_level(client, contracts["SPX"], _today_expiration())
 
         result = detect_volatility_regime(
-            vix1d_open=historical_data["VIX1D"].iloc[-1].open,
-            vix1d_history=historical_data["VIX1D"]["close"],
-            vix_open=historical_data["VIX"].iloc[-1].open,
-            vix_prev_close=historical_data["VIX"].iloc[-2].close,
-            spx_closes=historical_data["SPX"]["close"],
-            spx_price=historical_data["SPX"].iloc[-1]["close"],
+            vix1d_open=_field(vix1d_today, "open"),
+            # Opens, matching the metric definition — not closes.
+            vix1d_history=vix1d_past["open"] if not vix1d_past.empty else None,
+            vix_open=_field(vix_today, "open"),
+            vix_prev_close=_field(vix_past.iloc[-1] if not vix_past.empty else None, "close"),
+            spx_closes=spx_past["close"] if not spx_past.empty else None,
+            spx_price=spot,
             zero_gamma_level=zgl,
-            vix_history=historical_data["VIX"].open,
+            vix_history=vix_past["open"] if not vix_past.empty else None,
             zgl_source="GexCalculator/ibtws (Black-Scholes sweep, Brent root-find)",
         )
 
