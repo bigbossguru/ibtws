@@ -54,4 +54,4 @@ jobs:
         run: poetry run pre-commit run --all-files --show-diff-on-failure
 
       - name: Run unit tests
-        run: poetry run pytest tests/ -v
+        run: poetry run pytest tests/ -v --cov=ibtws --cov-report=term-missing

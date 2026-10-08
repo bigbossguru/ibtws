@@ -48,8 +48,9 @@ def make_trade(
     filled: float = 0.0,
     remaining: float = 0.0,
     avg_fill_price: float = 0.0,
+    order_id: int = 0,
 ) -> SimpleNamespace:
-    order = SimpleNamespace(orderRef=order_ref, permId=perm_id)
+    order = SimpleNamespace(orderRef=order_ref, permId=perm_id, orderId=order_id)
     return SimpleNamespace(
         order=order,
         orderStatus=make_order_status(status, filled=filled, remaining=remaining, avg_fill_price=avg_fill_price),
@@ -109,6 +110,7 @@ def fake_client():
     ib.orderStatusEvent = _EventHook()
     ib.execDetailsEvent = _EventHook()
     ib.positionEvent = _EventHook()
+    ib.errorEvent = _EventHook()
     ib.reqOpenOrdersAsync = AsyncMock(return_value=[])
     ib.reqPositionsAsync = AsyncMock(return_value=[])
     ib.openTrades = MagicMock(return_value=[])

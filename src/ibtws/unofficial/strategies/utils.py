@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Iterable, Optional, Sequence
 
+from ibtws.unofficial.helpers import days_to_expiry
 from ibtws.unofficial.option import OptionQuote
 
 from .models import SpreadType
@@ -26,23 +28,13 @@ class CreditSpreadError(RuntimeError):
 def _parse_expiry_to_dte(expiry: str, *, now: Optional[float] = None) -> int:
     """Convert a ``YYYYMMDD`` expiration string into days-to-expiry.
 
-    IBKR also returns ``YYYYMM`` for monthlies – treated as the third-Friday
-    convention (just use day 15 as a reasonable proxy). Negative DTEs (already
-    expired) are returned as-is so the caller can filter them out.
+    Counted in exchange time (America/New_York): a same-day expiry is ``0``
+    until the 16:00 ET close and ``-1`` afterwards. IBKR also returns
+    ``YYYYMM`` for monthlies – treated as day 15 as a reasonable proxy.
+    Negative DTEs (already expired) are returned as-is so the caller can
+    filter them out.
     """
-    if len(expiry) == 6:
-        expiry = expiry + "15"
-    if len(expiry) != 8 or not expiry.isdigit():
-        raise ValueError(f"Unrecognised expiry format: {expiry!r}")
-
-    import datetime as _dt
-
-    y, m, d = int(expiry[:4]), int(expiry[4:6]), int(expiry[6:])
-    target = _dt.datetime(y, m, d, 16, 0, 0, tzinfo=_dt.timezone.utc)  # 4pm ET close as proxy
-    ref = (
-        _dt.datetime.fromtimestamp(now, tz=_dt.timezone.utc) if now is not None else _dt.datetime.now(_dt.timezone.utc)
-    )
-    return (target - ref).days
+    return days_to_expiry(expiry, now=now)
 
 
 def select_expiry(
@@ -187,8 +179,23 @@ def _quote_mid(q: OptionQuote) -> Optional[float]:
     return (q.bid + q.ask) / 2.0
 
 
-def _round_to_tick(price: float, tick: float = 0.05) -> float:
-    """Round to the nearest IB-acceptable tick (default 5¢ for options)."""
+def _round_to_tick(price: float, tick: float = 0.05, mode: str = "nearest") -> float:
+    """Round to an IB-acceptable tick (default 5¢ for options).
+
+    ``mode`` picks the direction: ``"nearest"``, ``"down"`` (use for a credit
+    you want to collect, so the limit never asks for more than intended) or
+    ``"up"`` (use for a debit you are willing to pay, so the limit never bids
+    less than intended).
+    """
     if tick <= 0:
         return price
-    return round(price / tick) * tick
+    steps = price / tick
+    if mode == "nearest":
+        n = round(steps)
+    elif mode == "down":
+        n = math.floor(steps + 1e-9)
+    elif mode == "up":
+        n = math.ceil(steps - 1e-9)
+    else:
+        raise ValueError(f"Unknown rounding mode: {mode!r}")
+    return round(n * tick, 10)

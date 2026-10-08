@@ -8,14 +8,20 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.12"
-ib-async = {git = "https://github.com/bigbossguru/ib_async.git", rev = "v2.1.0"}
+# Pinned to the commit behind tag v2.1.0 so a moved tag cannot change the build.
+ib-async = {git = "https://github.com/bigbossguru/ib_async.git", rev = "91a2f78c5a02e674d2cc01e9b94532f7795dbf31"}
 pandas = ">=2.3,<4.0"
 scipy = "^1.18.0"
+matplotlib = {version = "^3.9", optional = true}
+
+[tool.poetry.extras]
+plot = ["matplotlib"]
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^4.6.0"
 pytest = "^9.0.2"
 pytest-asyncio = "^1.3.0"
+pytest-cov = "^7.0.0"
 
 [build-system]
 requires = ["poetry-core"]

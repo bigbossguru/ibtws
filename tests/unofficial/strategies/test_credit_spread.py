@@ -497,7 +497,8 @@ async def test_current_mid_debit_returns_none_on_missing_quote(fake_client, fake
     # Both legs return with a missing bid → mid unavailable.
     short_t = make_ticker_for(plan.short_leg.quote.contract, bid=0, ask=1.30)
     long_t = make_ticker_for(plan.long_leg.quote.contract, bid=0, ask=0.90)
-    fake_client.ib.reqTickersAsync = AsyncMock(return_value=[short_t, long_t])
+    by_conid = {short_t.contract.conId: short_t, long_t.contract.conId: long_t}
+    fake_client.ib.reqTickersAsync = AsyncMock(side_effect=lambda c, **_kw: [by_conid[c.conId]])
 
     assert await strat._current_mid_debit(plan) is None
 
@@ -524,7 +525,8 @@ async def test_current_mid_debit_computes_value(fake_client, fake_fetcher, fake_
     # Short mid 1.20, long mid 0.80 → debit 0.40
     short_t = make_ticker_for(plan.short_leg.quote.contract, bid=1.10, ask=1.30)
     long_t = make_ticker_for(plan.long_leg.quote.contract, bid=0.70, ask=0.90)
-    fake_client.ib.reqTickersAsync = AsyncMock(return_value=[short_t, long_t])
+    by_conid = {short_t.contract.conId: short_t, long_t.contract.conId: long_t}
+    fake_client.ib.reqTickersAsync = AsyncMock(side_effect=lambda c, **_kw: [by_conid[c.conId]])
 
     mid = await strat._current_mid_debit(plan)
     assert mid == pytest.approx(0.40)

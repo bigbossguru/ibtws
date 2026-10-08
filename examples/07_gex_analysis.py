@@ -22,13 +22,14 @@ from ib_async import Index
 from ibtws.config import IBKRConfig
 from ibtws.unofficial.client import IBKRClient
 from ibtws.unofficial.analysis.gex import GexCalculator
+from ibtws.unofficial.helpers import MARKET_TZ
 from ibtws.unofficial.option.chains import OptionChainFetcher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 
 
 async def main() -> None:
-    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)  # TWS paper
+    config = IBKRConfig.from_env(client_id=14)  # IBKR_HOST / IBKR_PORT, defaults to TWS paper on 127.0.0.1:7497
 
     async with IBKRClient(config) as client:
         await client.connect()
@@ -42,7 +43,7 @@ async def main() -> None:
 
         quotes = await chain_fetcher.fetch_snapshot(
             underlying,
-            expirations=["20260703"],
+            expirations=[datetime.now(MARKET_TZ).strftime("%Y%m%d")],  # today's 0DTE series
             strike_window_pct=0.03,
             trading_class="SPXW",
             rights=("C", "P"),
@@ -57,6 +58,7 @@ async def main() -> None:
             quotes.to_csv(f"spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False)
             calculator.compute(quotes)
             calculator.summary()
+            # plot() needs the optional extra: pip install "ibtws[plot]"
             calculator.plot(save_path=f"spx_chain_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
 
 

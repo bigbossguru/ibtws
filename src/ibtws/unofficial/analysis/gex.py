@@ -10,13 +10,22 @@ Computes:
     - Call Wall / Put Wall
     - GEX regime (positive/negative)
 
-Usage:
-    from gex_calculator import GexCalculator
+The profile sweep is vectorised with NumPy (one gamma matrix of
+``sweep_points × options``), so a full SPX chain computes in milliseconds.
+Time to expiry is measured per option from its own expiry's 16:00 ET close,
+independent of the host's timezone.
 
-    calc = GexCalculator("spx_chain_20260629_193146.csv")
-    calc.compute()
+Plotting needs matplotlib, which is an optional extra::
+
+    pip install "ibtws[plot]"
+
+Usage:
+    from ibtws.unofficial.analysis.gex import GexCalculator
+
+    calc = GexCalculator()
+    calc.compute(df)            # df from option.utils.quotes_to_dataframe
     calc.summary()
-    calc.plot(save_path="gex_chart.png")
+    png = calc.plot(save_path="gex_chart.png")
 
     # Access results programmatically
     print(calc.zero_gamma_level)
@@ -24,16 +33,26 @@ Usage:
     print(calc.total_gex)
 """
 
+from __future__ import annotations
+
 import io
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from scipy.stats import norm
 from scipy.optimize import brentq
+from scipy.stats import norm
+
+from ibtws.unofficial.helpers import expiry_close
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from matplotlib.figure import Figure
+
+logger = logging.getLogger(__name__)
+
+_SECONDS_PER_YEAR = 365.25 * 24 * 3600
 
 
 @dataclass
@@ -97,10 +116,18 @@ class GexCalculator:
         self.result: GexResult | None = None
 
     def compute(self, df: pd.DataFrame) -> GexResult:
-        """Run full GEX computation: static GEX, profile sweep, ZGL."""
-        # Load and validate data
-        self._df = df
+        """Run full GEX computation: static GEX, profile sweep, ZGL.
+
+        Rows missing strike / gamma / open interest / IV, with non-positive
+        IV, or already past their expiry are dropped before computing.
+        Raises ``ValueError`` for missing columns or when no usable row is left.
+        """
+        missing = self.REQUIRED_COLUMNS - set(df.columns)
+        if missing:
+            raise ValueError(f"DataFrame missing required columns: {sorted(missing)}")
+        self._df = self._clean(df)
         self.spot, self._T, self._r = self._derive_params()
+        df = self._df
 
         net = self._calc_static_gex()
         df_gex = self._compute_gex_column()
@@ -200,18 +227,22 @@ class GexCalculator:
 
     def plot(self, save_path: str | None = None, title_suffix: str = "") -> bytes:
         """
-        Generate combined GEX chart: profile curve + per-strike histogram.
+        Render the combined GEX chart (profile curve + per-strike histogram) as PNG bytes.
+
+        Never opens a window, so it is safe on servers. Requires matplotlib
+        (``pip install "ibtws[plot]"``).
 
         Parameters
         ----------
         save_path : str, optional
-            If provided, saves chart to file instead of showing.
+            If provided, also saves the chart to this file.
         title_suffix : str, optional
             Additional text for chart title.
         """
         if self.result is None:
             raise RuntimeError("Call compute() first")
 
+        plt = _pyplot()
         r = self.result
         fig = self._render_chart(r, save_path=save_path, title_suffix=title_suffix)
         buf = io.BytesIO()
@@ -220,18 +251,34 @@ class GexCalculator:
         buf.seek(0)
         return buf.getvalue()
 
+    @staticmethod
+    def _clean(df: pd.DataFrame) -> pd.DataFrame:
+        """Drop rows that cannot be priced; attach per-row time to expiry ``T``."""
+        out = df.copy()
+        for col in ("strike", "gamma", "open_interest", "iv", "underlying_price", "timestamp"):
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        out = out.dropna(subset=["strike", "gamma", "open_interest", "iv", "expiry", "timestamp"])
+        out = out[out["iv"] > 0]
+        # Expiry = 16:00 America/New_York on the expiry date, not midnight and
+        # not the host's local time — critical for 0DTE, where that is the
+        # difference between T>0 and T<0.
+        close_ts = out["expiry"].astype(str).map(lambda e: expiry_close(e).timestamp())
+        out["T"] = (close_ts - out["timestamp"]) / _SECONDS_PER_YEAR
+        expired = out["T"] <= 0
+        if expired.any():
+            logger.warning(f"GexCalculator: dropping {int(expired.sum())} row(s) at/after their expiry close")
+            out = out[~expired]
+        if out.empty:
+            raise ValueError("No usable option rows (need strike, gamma, open_interest, iv > 0 and T > 0).")
+        return out.reset_index(drop=True)
+
     def _derive_params(self):
-        spot = self._df["underlying_price"].iloc[-1]
-        # Expiry = 4pm close on the expiry date, not midnight — critical for 0DTE,
-        # where midnight vs. close is the difference between T>0 and T<0.
-        expiry = datetime.strptime(str(self._df["expiry"].iloc[-1]), "%Y%m%d").replace(hour=22, minute=0, second=0)
-        now = datetime.fromtimestamp(self._df["timestamp"].iloc[-1])
-        T = (expiry - now).total_seconds() / (365.25 * 24 * 3600)
-        if T <= 0:
-            raise ValueError(
-                f"Non-positive time to expiry ({T * 365.25:.3f} days): snapshot ({now}) is at/after "
-                f"the 4pm close on the expiry date ({expiry}). Check the timestamp's timezone matches system local time."
-            )
+        prices = self._df["underlying_price"].dropna()
+        prices = prices[prices > 0]
+        if prices.empty:
+            raise ValueError("Cannot determine spot: no positive underlying_price in the DataFrame.")
+        spot = float(prices.iloc[-1])
+        T = self._df["T"].to_numpy(dtype=float)
         return spot, T, self.risk_free_rate
 
     def _compute_gex_column(self) -> pd.DataFrame:
@@ -263,26 +310,43 @@ class GexCalculator:
         d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
+    def _gex_curve(self, S: np.ndarray) -> np.ndarray:
+        """Total net GEX at each hypothetical spot in ``S`` (vectorised BS repricing).
+
+        Builds one ``len(S) × n_options`` gamma matrix; puts carry a negative
+        sign (dealers assumed long calls / short puts).
+        """
+        S = np.atleast_1d(np.asarray(S, dtype=float))[:, None]
+        df = self._df
+        K = df["strike"].to_numpy(dtype=float)
+        sigma = df["iv"].to_numpy(dtype=float)
+        oi = df["open_interest"].to_numpy(dtype=float)
+        sign = np.where(df["right"].to_numpy() == "C", 1.0, -1.0)
+        T = np.broadcast_to(np.asarray(self._T, dtype=float), K.shape)
+        sqrt_t = np.sqrt(T)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            d1 = (np.log(S / K) + (self._r + 0.5 * sigma**2) * T) / (sigma * sqrt_t)
+            gamma = norm.pdf(d1) / (S * sigma * sqrt_t)
+        gamma = np.where(S > 0, gamma, 0.0)
+        return (gamma * oi * sign).sum(axis=1) * S[:, 0] ** 2 * 0.01
+
     def _total_gex_at(self, S: float) -> float:
         """Reprice all options at hypothetical spot S, return total net GEX."""
-        total = 0.0
-        for _, row in self._df.iterrows():
-            g = self._bs_gamma(S, row["strike"], self._T, self._r, row["iv"])
-            gex = g * row["open_interest"] * S**2 * 0.01
-            total += gex if row["right"] == "C" else -gex
-        return total
+        return float(self._gex_curve(np.array([S]))[0])
 
     def _find_zero_gamma(self) -> dict:
         """Sweep spot prices and find ZGL via Brent's method."""
         strikes = sorted(self._df["strike"].unique())
-        S_min = strikes[0] - 100
+        S_min = max(strikes[0] - 100, 1e-6)
         S_max = strikes[-1] + 100
         sweep = np.linspace(S_min, S_max, self.sweep_points)
-        gex_curve = np.array([self._total_gex_at(s) for s in sweep])
+        gex_curve = self._gex_curve(sweep)
 
         crossings = []
         for i in range(1, len(sweep)):
-            if gex_curve[i - 1] * gex_curve[i] <= 0:
+            # Strict sign change only: far from the strikes gamma underflows to
+            # exactly 0, and a pair of zeros is not a crossing.
+            if gex_curve[i - 1] * gex_curve[i] < 0:
                 try:
                     zgl = brentq(self._total_gex_at, sweep[i - 1], sweep[i], xtol=0.1)
                     direction = "neg→pos" if gex_curve[i - 1] < 0 else "pos→neg"
@@ -312,8 +376,9 @@ class GexCalculator:
             "gex_curve": gex_curve,
         }
 
-    def _render_chart(self, r: GexResult, save_path: str | None, title_suffix: str) -> plt.Figure:
+    def _render_chart(self, r: GexResult, save_path: str | None, title_suffix: str) -> Figure:
         """Render combined GEX chart."""
+        plt = _pyplot()
         net = r.net_gex_by_strike
         sweep = r.sweep_levels
         gex_curve = r.sweep_gex
@@ -433,8 +498,15 @@ class GexCalculator:
 
         if save_path:
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
-            logging.info(f"Chart saved → {save_path}")
-        else:
-            plt.show()
+            logger.info(f"Chart saved → {save_path}")
 
         return fig
+
+
+def _pyplot() -> Any:
+    """Import pyplot lazily so the calculator works without matplotlib installed."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError('GexCalculator.plot() needs matplotlib: pip install "ibtws[plot]"') from exc
+    return plt

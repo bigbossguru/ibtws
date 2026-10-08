@@ -76,3 +76,48 @@ async def test_append_preserves_order(tmp_path):
         await store.append(Cancelled(uuid=f"u{i}", perm_id=i))
     replayed = list(store.replay())
     assert [e.uuid for e in replayed] == [f"u{i}" for i in range(5)]
+
+
+async def test_replay_skips_unfinished_last_line(tmp_path):
+    store = JsonStore(tmp_path / "torn.jsonl", fsync=False)
+    await store.append(Cancelled(uuid="u1", perm_id=1))
+    store.close()
+    with store.path.open("a", encoding="utf-8") as f:
+        f.write('{"kind":"cancelled","uuid":"u2","perm')  # crash mid-write: no newline
+
+    assert [e.uuid for e in store.replay()] == ["u1"]
+
+
+async def test_append_truncates_unfinished_last_line(tmp_path):
+    path = tmp_path / "torn.jsonl"
+    store = JsonStore(path, fsync=False)
+    await store.append(Cancelled(uuid="u1", perm_id=1))
+    store.close()
+    with path.open("a", encoding="utf-8") as f:
+        f.write('{"kind":"cancelled","uuid":"u2","perm')
+
+    reopened = JsonStore(path, fsync=False)
+    await reopened.append(Cancelled(uuid="u3", perm_id=3))
+    reopened.close()
+
+    assert [e.uuid for e in reopened.replay()] == ["u1", "u3"]
+
+
+async def test_append_truncates_file_that_is_only_a_torn_line(tmp_path):
+    path = tmp_path / "torn.jsonl"
+    path.write_text('{"kind":"cance', encoding="utf-8")
+    store = JsonStore(path, fsync=False)
+
+    await store.append(Cancelled(uuid="u1", perm_id=1))
+    store.close()
+
+    assert [e.uuid for e in store.replay()] == ["u1"]
+
+
+def test_replay_reads_legacy_fill_without_contract_fields(tmp_path):
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(
+        '{"kind":"fill","uuid":"u","perm_id":1,"exec_id":"e","price":1.0,"quantity":1.0,"timestamp":0}' + chr(10)
+    )
+    [ev] = list(JsonStore(path, fsync=False).replay())
+    assert isinstance(ev, Filled) and ev.con_id == 0 and ev.sec_type == ""

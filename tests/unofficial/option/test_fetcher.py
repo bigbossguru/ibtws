@@ -135,8 +135,8 @@ async def test_fetch_snapshot_filters_out_empty_tickers(fetcher, fake_client):
 
     def tickers_with_one_empty(*cs, **_kw):
         result = []
-        for i, c in enumerate(cs):
-            if i == 0:
+        for c in cs:
+            if c.strike == 150.0:
                 result.append(make_ticker(c))  # valid
             else:
                 # Empty ticker — no bid/ask/iv
@@ -213,7 +213,29 @@ async def test_fetch_snapshot_batches_snapshots(fetcher, fake_client):
     )
 
     assert len(quotes) == 6
-    assert fake_client.ib.reqTickersAsync.await_count == 3
+    # One snapshot per contract; batches only bound the streaming lines.
+    assert fake_client.ib.reqTickersAsync.await_count == 6
+    assert fake_client.ib.reqMktData.call_count == 6
+    assert fake_client.ib.cancelMktData.call_count == 6
+
+
+async def test_fetch_snapshot_survives_one_failing_contract(fetcher, fake_client):
+    fake_client.ib.reqSecDefOptParamsAsync.return_value = [
+        make_chain_param(expirations=("20260116",), strikes=(140.0, 150.0))
+    ]
+    fake_client.ib.qualifyContractsAsync.side_effect = async_side(_qualify_options)
+
+    async def tickers(*cs, **_kw):
+        if cs[0].strike == 140.0:
+            raise RuntimeError("10090: Part of requested market data is not subscribed")
+        return [make_ticker(c) for c in cs]
+
+    fake_client.ib.reqTickersAsync.side_effect = tickers
+
+    quotes = await fetcher.fetch_snapshot(make_underlying(), expirations=["20260116"], strikes=[140.0, 150.0])
+
+    assert {q.contract.strike for q in quotes} == {150.0}
+    assert fake_client.ib.cancelMktData.call_count == 4
 
 
 async def test_fetch_snapshot_auto_windows_strikes_around_spot(fetcher, fake_client):

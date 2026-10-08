@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 
 async def main() -> None:
-    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)  # TWS paper
+    config = IBKRConfig.from_env(client_id=14)  # IBKR_HOST / IBKR_PORT, defaults to TWS paper on 127.0.0.1:7497
 
     async with IBKRClient(config) as client:
         # 1 = live, 2 = frozen, 3 = delayed, 4 = delayed-frozen

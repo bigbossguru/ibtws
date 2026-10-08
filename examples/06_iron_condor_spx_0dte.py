@@ -3,7 +3,8 @@
 What this example does
 ----------------------
 * Connects to TWS (paper by default — read every line before flipping the
-  ``DRY_RUN`` switch below).
+  ``DRY_RUN`` switch below). Connection details come from ``IBKR_HOST`` /
+  ``IBKR_PORT`` / ``IBKR_CLIENT_ID`` (see :meth:`IBKRConfig.from_env`).
 * From the configured ``OPEN_AT_ET`` (default 09:00 ET) until ``STOP_OPENING_AT_ET``
   (default 15:30 ET), every ``INTERVAL_MIN`` minutes (default 15), builds a
   fresh symmetric SPX 0DTE iron condor (bull-put + bear-call on SPXW with
@@ -11,10 +12,13 @@ What this example does
 * Each condor runs its own background monitor task with **per-side SL** and
   **one combined take-profit** (close both sides when their combined
   remaining mid-debit falls to ``(1 - COMBINED_TP_PCT) * total_credit``).
-* At ``FLATTEN_AT_ET`` (default 15:55 ET) every still-open position is
-  market-closed via ``OrderManager.close_all_positions()`` — 0DTE SPX is
-  cash-settled but you really don't want to ride the last 5 minutes of
-  gamma if the monitor missed an exit.
+  Every exit is confirmed: an unfilled close is cancelled, re-priced and
+  re-sent, and stop-loss exits escalate to a marketable price.
+* Each side is managed at the size that actually filled. If one side never
+  fills its order is cancelled and the other side is still managed.
+* At ``FLATTEN_AT_ET`` (default 15:55 ET) every monitor closes what is left
+  of its condor as combos; afterwards ``close_all_positions`` runs as a
+  backstop restricted to the legs this script traded.
 
 Caveats — read before going live
 --------------------------------
@@ -39,14 +43,15 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 from ib_async import Index
 
 from ibtws.config import IBKRConfig
 from ibtws.unofficial.client import IBKRClient
+from ibtws.unofficial.helpers import MARKET_TZ as ET
 from ibtws.unofficial.option import OptionChainFetcher
 from ibtws.unofficial.order import JsonStore, OrderManager
+from ibtws.unofficial.order.models import TrackedOrder
 from ibtws.unofficial.strategies import (
     CreditSpreadError,
     CreditSpreadParams,
@@ -54,7 +59,6 @@ from ibtws.unofficial.strategies import (
     CreditSpreadStrategy,
     SpreadType,
 )
-from ibtws.unofficial.order.models import TrackedOrder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger("spx_0dte_ic")
@@ -63,12 +67,10 @@ logger = logging.getLogger("spx_0dte_ic")
 # Tunables
 # ---------------------------------------------------------------------------
 
-ET = ZoneInfo("America/New_York")
-
-DRY_RUN = False  # set False to actually submit
+DRY_RUN = True  # set False to actually submit
 OPEN_AT_ET = time(9, 0)  # first condor at 09:00 ET (GTH — see caveat)
 STOP_OPENING_AT_ET = time(15, 30)  # last condor no later than 15:30 ET
-FLATTEN_AT_ET = time(15, 55)  # market-close everything by 15:55 ET
+FLATTEN_AT_ET = time(15, 55)  # close everything by 15:55 ET
 INTERVAL_MIN = 15  # one condor every 15 minutes
 MAX_CONCURRENT_CONDORS = 8  # safety cap
 
@@ -81,7 +83,9 @@ COMBINED_TP_PCT = 0.5  # close BOTH at 50 % of total credit captured
 QUANTITY = 1
 MIN_CREDIT_WIDTH_RATIO = 0.05  # 0DTE skew is thin; accept ≥5 % of width
 LIMIT_SLIPPAGE = 0.05
-MONITOR_POLL_SEC = 30.0
+MONITOR_POLL_SEC = 2.0  # streaming quotes: polling is a local read, no IB round trip
+MAX_QUOTE_FAILURES = 60  # ~2 min without a usable quote → close the condor
+LIVE_QUOTES = True  # require real-time quotes for every decision
 
 
 # ---------------------------------------------------------------------------
@@ -99,72 +103,111 @@ class CondorPosition:
 
 
 async def monitor_condor(
+    client: IBKRClient,
     strat: CreditSpreadStrategy,
     condor: CondorPosition,
     *,
     combined_take_profit_pct: float,
     poll_interval: float,
-    max_wait: Optional[float] = None,
+    deadline: datetime,
 ) -> None:
     """Per-side SL + combined TP loop for one iron condor.
 
-    See example 06 for the same logic inline. Quote drop-outs skip the
-    iteration; the combined-TP check only runs when we have a fresh mid on
-    every still-open side.
+    Both entries are awaited together; each side is then managed at its
+    filled size. Quote drop-outs skip the iteration, and the combined-TP
+    check only runs when every still-open side has a fresh mid. At the
+    deadline, after repeated quote loss while connected, or on any error,
+    whatever is open is closed urgently. While TWS is disconnected the loop
+    just waits: the client reconnects and the strategy resubscribes quotes.
     """
-    if not await strat._await_entry_fill(condor.put_entry, max_wait=max_wait):
-        logger.warning(f"[{condor.label}] put entry did not fill; aborting monitor")
+
+    def seconds_left() -> float:
+        return max((deadline - datetime.now(ET)).total_seconds(), 0.0)
+
+    put_qty, call_qty = await asyncio.gather(
+        strat.await_entry(condor.put_entry, max_wait=seconds_left(), quantity=QUANTITY),
+        strat.await_entry(condor.call_entry, max_wait=seconds_left(), quantity=QUANTITY),
+    )
+    open_sides: dict[str, tuple[CreditSpreadPlan, float]] = {
+        name: (plan, qty)
+        for name, plan, qty in (("put", condor.put_plan, put_qty), ("call", condor.call_plan, call_qty))
+        if qty > 0
+    }
+    if not open_sides:
+        logger.warning(f"[{condor.label}] neither side filled; nothing to manage")
         return
-    if not await strat._await_entry_fill(condor.call_entry, max_wait=max_wait):
-        logger.warning(f"[{condor.label}] call entry did not fill; aborting monitor")
-        return
+    if len(open_sides) == 1:
+        logger.warning(f"[{condor.label}] only the {next(iter(open_sides))} side filled; managing it alone")
 
     mult = condor.put_plan.multiplier
-    total_credit_per_share = (condor.put_plan.net_credit + condor.call_plan.net_credit) / mult
+    total_credit_per_share = sum(plan.net_credit for plan, _ in open_sides.values()) / mult
     tp_combined_debit = (1.0 - combined_take_profit_pct) * total_credit_per_share
 
-    open_sides: dict[str, CreditSpreadPlan] = {
-        "put": condor.put_plan,
-        "call": condor.call_plan,
-    }
+    async def close_side(name: str, *, urgent: bool, mid: Optional[float] = None) -> None:
+        plan, qty = open_sides[name]
+        result = await strat.close_and_confirm(plan, qty, urgent=urgent, mid_debit=mid)
+        logger.info(f"[{condor.label}]   {name}: closed {result.closed_quantity:g}/{qty:g}")
+        if result.complete:
+            open_sides.pop(name)
+        else:
+            open_sides[name] = (plan, result.remaining_quantity)
 
-    started = asyncio.get_event_loop().time()
-    while open_sides:
-        if max_wait is not None and asyncio.get_event_loop().time() - started > max_wait:
-            logger.info(f"[{condor.label}] monitor timeout, {len(open_sides)} side(s) still open")
-            return
-
-        await asyncio.sleep(poll_interval)
-
-        mids: dict[str, float] = {}
-        for name, plan in open_sides.items():
-            mid = await strat._current_mid_debit(plan)
-            if mid is not None:
-                mids[name] = mid
-
-        if len(mids) == len(open_sides):
-            combined = sum(mids.values())
-            if combined <= tp_combined_debit:
-                logger.info(
-                    f"[{condor.label}] combined TP hit — debit {combined:.2f} <= "
-                    f"target {tp_combined_debit:.2f} (of {total_credit_per_share:.2f} credit)"
-                )
-                for name, plan in list(open_sides.items()):
-                    mid = mids[name]
-                    closed = await strat.close(plan, limit_debit=mid * (1.0 + plan.params.limit_slippage))
-                    logger.info(f"[{condor.label}]   closed {name} uuid={closed.uuid}")
+    watched = [plan for plan, _ in open_sides.values()]
+    for plan in watched:
+        strat.watch(plan)
+    failures = 0
+    try:
+        while open_sides:
+            if seconds_left() <= 0:
+                logger.info(f"[{condor.label}] flatten time — closing {len(open_sides)} side(s)")
+                for name in list(open_sides):
+                    await close_side(name, urgent=True)
                 return
 
-        for name in list(open_sides.keys()):
-            mid = mids.get(name)
-            if mid is None:
-                continue
-            plan = open_sides[name]
-            if plan.stop_loss_debit is not None and mid >= plan.stop_loss_debit:
-                logger.warning(f"[{condor.label}] {name} SL hit — mid {mid:.2f} >= SL {plan.stop_loss_debit:.2f}")
-                closed = await strat.close(plan, limit_debit=mid * (1.0 + plan.params.limit_slippage))
-                logger.info(f"[{condor.label}]   closed {name} uuid={closed.uuid}")
-                open_sides.pop(name)
+            await asyncio.sleep(min(poll_interval, seconds_left()))
+
+            mids: dict[str, float] = {}
+            for name, (plan, _) in open_sides.items():
+                mid = await strat.current_mid_debit(plan)
+                if mid is not None:
+                    mids[name] = mid
+
+            if len(mids) < len(open_sides):
+                failures += 1
+                if failures >= MAX_QUOTE_FAILURES and client.is_connected():
+                    logger.error(f"[{condor.label}] no usable quotes for {failures} polls — closing")
+                    for name in list(open_sides):
+                        await close_side(name, urgent=True)
+                    return
+            else:
+                failures = 0
+
+            if len(mids) == len(open_sides):
+                combined = sum(mids.values())
+                if combined <= tp_combined_debit:
+                    logger.info(
+                        f"[{condor.label}] combined TP hit — debit {combined:.2f} <= "
+                        f"target {tp_combined_debit:.2f} (of {total_credit_per_share:.2f} credit)"
+                    )
+                    for name in list(open_sides):
+                        await close_side(name, urgent=False, mid=mids[name])
+                    continue
+
+            for name in list(open_sides):
+                mid = mids.get(name)
+                plan, _ = open_sides[name]
+                if mid is not None and plan.stop_loss_debit is not None and mid >= plan.stop_loss_debit:
+                    logger.warning(f"[{condor.label}] {name} SL hit — mid {mid:.2f} >= SL {plan.stop_loss_debit:.2f}")
+                    await close_side(name, urgent=True, mid=mid)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(f"[{condor.label}] monitor failed — closing what is open")
+        for name in list(open_sides):
+            await close_side(name, urgent=True)
+    finally:
+        for plan in watched:
+            strat.unwatch(plan)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +253,7 @@ def _build_params(underlying, today_yyyymmdd: str, spread_type: SpreadType) -> C
         min_open_interest=0,
         min_volume=0,
         outside_rth=True,
+        require_live_quotes=LIVE_QUOTES,
     )
 
 
@@ -219,21 +263,19 @@ def _build_params(underlying, today_yyyymmdd: str, spread_type: SpreadType) -> C
 
 
 async def main() -> None:
-    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)
+    config = IBKRConfig.from_env(client_id=14)  # defaults to TWS paper on 127.0.0.1:7497
     store = JsonStore(Path(__file__).parent / "orders.jsonl")
 
     async with IBKRClient(config) as client:
-        await client.connect()
-        client.ib.reqMarketDataType(2)
+        client.ib.reqMarketDataType(1 if LIVE_QUOTES else 2)
 
         underlying = Index("SPX", "CBOE", "USD")
         [underlying] = await client.ib.qualifyContractsAsync(underlying)
 
         manager = OrderManager(client, store)
         await manager.start()
-        # Shared fetcher with a tight freshness window so the 15-minute scheduler
-        # never acts on a stale 0DTE quote; subscriptions are released by
-        # CreditSpreadStrategy.close() to stay under IB's per-session cap.
+        # One shared fetcher: it caches the SPXW chain definition and the
+        # qualified option contracts across the day's slots.
         fetcher = OptionChainFetcher(client)
         strat = CreditSpreadStrategy(client, manager, fetcher=fetcher)
 
@@ -253,12 +295,13 @@ async def main() -> None:
         )
 
         monitor_tasks: list[asyncio.Task] = []
+        traded_legs: set[int] = set()
         opened = 0
 
         # ---------------- scheduling loop ----------------
         slot = _next_slot_after(datetime.now(ET), first_slot, interval)
         while slot <= stop_opening:
-            # await _sleep_until(slot)
+            await _sleep_until(slot)
             slot_label = slot.strftime("%H:%M")
             logger.info(f"=== slot {slot_label} ET ===")
 
@@ -298,74 +341,60 @@ async def main() -> None:
                 slot += interval
                 continue
 
+            placed: list[TrackedOrder] = []
             try:
-                put_entry = await strat.place(put_plan)
-                call_entry = await strat.place(call_plan)
+                placed.append(await strat.place(put_plan))
+                placed.append(await strat.place(call_plan))
             except Exception as exc:  # noqa: BLE001
                 logger.exception(f"[{slot_label}] placement failed: {exc}")
-                # If only one side placed, cancel any working order on that side.
-                # (cancel_all is cheap and idempotent.)
-                await manager.cancel_all()
+                # Cancel only this slot's order(s); other condors keep running.
+                for order in placed:
+                    await manager.cancel(order.uuid)
                 slot += interval
                 continue
 
+            for plan in (put_plan, call_plan):
+                traded_legs.update((plan.short_leg.conId, plan.long_leg.conId))
             opened += 1
             condor = CondorPosition(
                 label=f"{slot_label}#{opened}",
                 put_plan=put_plan,
                 call_plan=call_plan,
-                put_entry=put_entry,
-                call_entry=call_entry,
+                put_entry=placed[0],
+                call_entry=placed[1],
             )
-            logger.info(f"[{condor.label}] placed put={put_entry.uuid} call={call_entry.uuid}")
+            logger.info(f"[{condor.label}] placed put={condor.put_entry.uuid} call={condor.call_entry.uuid}")
 
             # Monitor runs until combined TP, per-side SL on both, or flatten time.
-            wait_budget = (flatten_at - datetime.now(ET)).total_seconds()
             monitor_tasks.append(
                 asyncio.create_task(
                     monitor_condor(
+                        client,
                         strat,
                         condor,
                         combined_take_profit_pct=COMBINED_TP_PCT,
                         poll_interval=MONITOR_POLL_SEC,
-                        max_wait=max(wait_budget, 0),
+                        deadline=flatten_at,
                     ),
                     name=f"monitor-{condor.label}",
                 )
             )
             slot += interval
 
-        # ---------------- post-schedule: drain monitors ----------------
+        # ---------------- post-schedule: let monitors finish ----------------
+        # Each monitor closes its own condor at flatten time, so just wait.
         if monitor_tasks:
-            remaining = (flatten_at - datetime.now(ET)).total_seconds()
-            if remaining > 0:
-                logger.info(
-                    f"all slots scheduled; {len(monitor_tasks)} monitor(s) running "
-                    f"for up to {remaining:.0f}s until flatten"
-                )
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*monitor_tasks, return_exceptions=True),
-                        timeout=remaining,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+            logger.info(f"all slots scheduled; waiting for {len(monitor_tasks)} monitor(s)")
+            await asyncio.gather(*monitor_tasks, return_exceptions=True)
 
-        # ---------------- flatten anything still open ----------------
+        # ---------------- backstop: flatten this script's legs ----------------
         await _sleep_until(flatten_at)
         if DRY_RUN:
-            logger.info("DRY_RUN — skipping flatten + cancel_all")
-        else:
-            logger.info("flatten window reached — cancelling working orders and closing positions")
+            logger.info("DRY_RUN — skipping flatten backstop")
+        elif traded_legs:
             await manager.cancel_all()
-            closed = await manager.close_all_positions(kind="market")
-            logger.info(f"flatten: submitted {len(closed)} closing market orders")
-
-        # Cancel any monitor tasks still hanging on (they should be done already).
-        for t in monitor_tasks:
-            if not t.done():
-                t.cancel()
-        await asyncio.gather(*monitor_tasks, return_exceptions=True)
+            closed = await manager.close_all_positions(kind="market", con_ids=traded_legs)
+            logger.info(f"flatten backstop: submitted {len(closed)} closing market order(s)")
 
         await manager.stop()
 

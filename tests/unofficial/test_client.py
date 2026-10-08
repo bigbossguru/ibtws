@@ -22,10 +22,33 @@ from ibtws.unofficial.client import IBKRClient
 # ---------------------------------------------------------------------------
 
 
+class _Hook:
+    """Minimal stand-in for an ib_async ``Event`` (``+=`` / ``-=`` / emit)."""
+
+    def __init__(self) -> None:
+        self.handlers: list = []
+
+    def __iadd__(self, fn):
+        self.handlers.append(fn)
+        return self
+
+    def __isub__(self, fn):
+        if fn in self.handlers:
+            self.handlers.remove(fn)
+        return self
+
+    def emit(self, *args) -> None:
+        for h in list(self.handlers):
+            h(*args)
+
+
 class FakeIB:
     """Minimal stand-in for ``ib_async.IB`` covering only what the client uses."""
 
     def __init__(self) -> None:
+        self.disconnectedEvent = _Hook()
+        self.errorEvent = _Hook()
+
         self.RequestTimeout: float | None = None
         self.RaiseRequestErrors: bool | None = None
 
@@ -48,6 +71,12 @@ class FakeIB:
     def disconnect(self) -> None:
         self.disconnect_calls += 1
         self._connected = False
+        self.disconnectedEvent.emit()
+
+    def drop(self) -> None:
+        """Simulate TWS closing the socket on us."""
+        self._connected = False
+        self.disconnectedEvent.emit()
 
 
 @pytest.fixture
@@ -234,3 +263,108 @@ async def test_get_historical_data_returns_empty_dataframe_when_util_df_none(cli
 
     assert isinstance(df, pd.DataFrame)
     assert df.empty
+
+
+async def test_get_market_data_cancels_subscription_on_error(client, patch_ib):
+    ib = patch_ib["ib"]
+    ib.reqTickersAsync.side_effect = RuntimeError("snapshot failed")
+    contract = MagicMock(name="contract")
+
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        await client.get_market_data(contract)
+
+    ib.cancelMktData.assert_called_once_with(contract)
+
+
+async def test_get_market_data_without_generic_ticks_skips_streaming(client, patch_ib):
+    ib = patch_ib["ib"]
+    contract = MagicMock(name="contract")
+
+    await client.get_market_data(contract, generic_ticks="")
+
+    ib.reqMktData.assert_not_called()
+    ib.cancelMktData.assert_not_called()
+    ib.reqTickersAsync.assert_awaited_once_with(contract)
+
+
+# ---------------------------------------------------------------------------
+# reconnect supervision
+# ---------------------------------------------------------------------------
+
+
+async def test_unexpected_disconnect_reconnects_and_notifies_listeners(client, patch_ib):
+    ib = patch_ib["ib"]
+    calls: list[str] = []
+
+    async def async_listener():
+        calls.append("async")
+
+    client.add_reconnect_listener(lambda: calls.append("sync"))
+    client.add_reconnect_listener(async_listener)
+    await client.connect()
+
+    ib.drop()
+    await client._reconnect_task
+
+    assert ib.connectAsync.await_count == 2
+    assert ib.isConnected() is True
+    assert calls == ["sync", "async"]
+
+
+async def test_explicit_disconnect_does_not_reconnect(client, patch_ib):
+    ib = patch_ib["ib"]
+    await client.connect()
+    await client.disconnect()
+
+    assert client._reconnect_task is None
+    assert ib.connectAsync.await_count == 1
+
+
+async def test_auto_reconnect_disabled(patch_ib, config):
+    config.auto_reconnect = False
+    client = IBKRClient(config)
+    ib = patch_ib["ib"]
+    await client.connect()
+
+    ib.drop()
+
+    assert client._reconnect_task is None
+    assert ib.connectAsync.await_count == 1
+
+
+async def test_reconnect_retries_then_gives_up(patch_ib, config):
+    config.reconnect_max_attempts = 3
+    client = IBKRClient(config)
+    ib = patch_ib["ib"]
+    await client.connect()
+    ib.connectAsync.side_effect = ConnectionRefusedError("TWS restarting")
+
+    ib.drop()
+    await client._reconnect_task
+
+    assert ib.connectAsync.await_count == 1 + 3
+    assert ib.isConnected() is False
+
+
+async def test_connectivity_restored_with_data_loss_notifies_listeners(client, patch_ib):
+    import asyncio
+
+    ib = patch_ib["ib"]
+    calls: list[int] = []
+    client.add_reconnect_listener(lambda: calls.append(1))
+
+    ib.errorEvent.emit(-1, 1101, "Connectivity restored - data lost", None)
+    await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()])
+
+    assert calls == [1]
+
+
+def test_config_from_env(monkeypatch):
+    monkeypatch.setenv("IBKR_HOST", "10.0.0.5")
+    monkeypatch.setenv("IBKR_PORT", "4002")
+    monkeypatch.setenv("IBKR_READONLY", "true")
+    monkeypatch.delenv("IBKR_CLIENT_ID", raising=False)
+
+    cfg = IBKRConfig.from_env(client_id=21)
+
+    assert (cfg.host, cfg.port, cfg.client_id, cfg.readonly) == ("10.0.0.5", 4002, 21, True)

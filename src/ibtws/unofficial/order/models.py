@@ -223,6 +223,11 @@ class Filled:
     exec_id: str
     price: float
     quantity: float
+    # Contract that actually traded. For a BAG (combo) order IB reports one
+    # execution per leg under the combo's orderRef, so consumers summing
+    # quantities must group by ``con_id`` / ignore leg ``sec_type`` rows.
+    con_id: int = 0
+    sec_type: str = ""
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
