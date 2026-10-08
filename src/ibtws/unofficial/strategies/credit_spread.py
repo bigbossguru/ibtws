@@ -52,7 +52,7 @@ from ib_async import Bag, ComboLeg
 
 from ibtws.unofficial.client import IBKRClient
 from ibtws.unofficial.option import OptionChainFetcher, OptionQuote
-from ibtws.unofficial.helpers import safe_pick_value
+from ibtws.unofficial.helpers import safe_pick_value, snapshot_each
 from ibtws.unofficial.order.manager import OrderManager
 from ibtws.unofficial.order.models import OrderSide, OrderState, TimeInForce, TrackedOrder
 
@@ -587,17 +587,11 @@ class CreditSpreadStrategy:
             if self._is_stale(short_t) or self._is_stale(long_t):
                 return None
         else:
-            try:
-                tickers = await asyncio.wait_for(
-                    self._client.ib.reqTickersAsync(short_c, long_c, regulatorySnapshot=False),
-                    timeout=15.0,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"CreditSpread: failed to re-quote spread for monitor: {exc}")
+            short_t, long_t = await snapshot_each(
+                self._client.ib, [short_c, long_c], timeout=15.0, regulatorySnapshot=False
+            )
+            if short_t is None or long_t is None:
                 return None
-            if len(tickers) != 2:
-                return None
-            short_t, long_t = tickers
         if plan.params.require_live_quotes and not (_is_live(short_t) and _is_live(long_t)):
             return None
         return _spread_mid_debit(short_t, long_t)

@@ -876,3 +876,44 @@ async def test_cancel_of_unknown_inactive_order_closes_it(manager, fake_client):
     fake_client.ib.errorEvent.fire(44, 10147, "OrderId 44 that needs to be cancelled is not found.", None)
 
     assert await manager.wait_for(lambda: tracked.state in (OrderState.REJECTED,), timeout=0.1)
+
+
+async def test_resync_replays_fills_missed_while_disconnected(manager, fake_client):
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=9)
+    tracked = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+    seen: list = []
+    manager.on_event(lambda e: seen.append(e))
+
+    # After a reconnect ib_async rebuilds the trade from the startup fetch:
+    # status Filled and the execution in trade.fills, but no execDetailsEvent.
+    filled_trade = make_trade(tracked.uuid, perm_id=9, status="Filled", filled=1)
+    filled_trade.fills = [make_fill("E-missed", price=100.0, shares=1)]
+    fake_client.ib.trades.return_value = [filled_trade]
+    await manager.resync()
+    await manager.resync()  # a second resync must not duplicate the fill
+
+    fills = [e for e in seen if isinstance(e, Filled)]
+    assert [f.exec_id for f in fills] == ["E-missed"]
+    assert tracked.state == OrderState.FILLED
+
+
+async def test_current_pnl_survives_one_unsubscribed_contract(manager, fake_client):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    # Live TWS: error 10090 on one contract used to blank every position's price.
+    fake_client.ib.positionEvent.fire(make_position(contract=make_contract(con_id=1), quantity=1, avg_cost=10))
+    fake_client.ib.positionEvent.fire(make_position(contract=make_contract(con_id=2), quantity=1, avg_cost=20))
+    await asyncio.sleep(0)
+
+    async def tickers(contract, **_kw):
+        if contract.conId == 1:
+            raise RuntimeError("API error: 10090: Part of requested market data is not subscribed")
+        return [SimpleNamespace(contract=contract, bid=25.0, ask=25.2, last=25.0, close=24.0)]
+
+    fake_client.ib.reqTickersAsync = AsyncMock(side_effect=tickers)
+
+    by_conid = {p.contract["conId"]: p for p in await manager.current_pnl()}
+
+    assert by_conid[1].market_price is None
+    assert by_conid[2].market_price == pytest.approx(25.1)

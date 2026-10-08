@@ -348,8 +348,10 @@ Matched orders are rehydrated into `TrackedOrder` objects so `cancel()` and
 
 `IBKRClient` reconnects on its own after an unexpected drop (TWS daily
 restart, network loss) and then calls `manager.resync()`, which refreshes
-positions and replays the latest IB status of every tracked order, so fills
-and cancels that happened while disconnected still reach subscribers.
+positions, replays executions that happened while disconnected as `Filled`
+events (exactly once), and replays the latest IB status of every tracked
+order, so fills and cancels that happened while disconnected still reach
+subscribers.
 
 ## Rate Limiting
 

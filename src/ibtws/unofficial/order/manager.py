@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Iterable, Optional, Sequence
 
 from ibtws.unofficial._pacing import ThrottledExecutor
+from ibtws.unofficial.helpers import snapshot_each
 
 from .factory import (
     bracket_to_orders,
@@ -273,6 +274,9 @@ class OrderManager:
         Refreshes positions and replays the latest status of every tracked
         order that IB knows about, so fills or cancellations that happened
         while the socket was down reach the tracked orders and subscribers.
+        Executions IB delivered during the reconnect's startup fetch are
+        replayed as :class:`Filled` events (ib_async does not emit
+        ``execDetailsEvent`` for them); already-seen exec ids are skipped.
         Registered automatically with :meth:`IBKRClient.add_reconnect_listener`.
         """
         if not self._started:
@@ -287,6 +291,8 @@ class OrderManager:
             if tracked is None:
                 continue
             tracked.trade = trade
+            for fill in list(getattr(trade, "fills", None) or []):
+                self._on_exec_details(trade, fill)
             new_state = _IB_STATUS_TO_STATE.get(trade.orderStatus.status)
             if new_state is not None and tracked.state not in _TERMINAL_STATES and new_state != tracked.state:
                 self._on_order_status(trade)
@@ -794,18 +800,16 @@ class OrderManager:
         quotable = [c for _, c in targets if c is not None]
         ticker_by_conid: dict[int, Any] = {}
         if quotable:
-            try:
-                async with self._slot():
-                    tickers = await asyncio.wait_for(
-                        self._client.ib.reqTickersAsync(*quotable, regulatorySnapshot=False),
-                        timeout=snapshot_timeout,
-                    )
-                for t in tickers or []:
-                    cid = int(getattr(t.contract, "conId", 0) or 0)
-                    if cid:
-                        ticker_by_conid[cid] = t
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"OrderManager.current_pnl: snapshot failed: {exc}")
+            # One snapshot per contract: a contract without a market-data
+            # subscription must not blank out the prices of all the others.
+            async with self._slot():
+                tickers = await snapshot_each(
+                    self._client.ib, quotable, timeout=snapshot_timeout, regulatorySnapshot=False
+                )
+            for contract, t in zip(quotable, tickers):
+                cid = int(getattr(contract, "conId", 0) or 0)
+                if t is not None and cid:
+                    ticker_by_conid[cid] = t
 
         results: list[PositionPnL] = []
         for pos, contract in targets:

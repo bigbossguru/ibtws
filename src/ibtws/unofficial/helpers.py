@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import datetime as _dt
-from typing import Sequence
+from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 
@@ -77,6 +78,29 @@ def calc_dte(expiration: str) -> float:
     exp_date = _dt.datetime.strptime(expiration, "%Y%m%d").date()
     delta = exp_date - market_now().date()
     return max(delta.days, 0.0)
+
+
+async def snapshot_each(ib: Any, contracts: Sequence[Any], *, timeout: float | None, **kwargs: Any) -> list[Any]:
+    """Snapshot every contract with its own ``reqTickersAsync`` call.
+
+    ``reqTickersAsync(*contracts)`` fails as a whole when IB errors on any one
+    contract (e.g. 10090 "market data is not subscribed"), losing the quotes
+    of all the others. Here each contract succeeds or fails on its own: the
+    result is positional, with ``None`` for a contract whose snapshot failed
+    or timed out. ``kwargs`` are passed through (e.g. ``regulatorySnapshot``).
+    """
+
+    async def one(contract: Any) -> Any:
+        try:
+            tickers = await asyncio.wait_for(ib.reqTickersAsync(contract, **kwargs), timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"snapshot failed for {getattr(contract, 'symbol', '?')} conId={getattr(contract, 'conId', 0)}: {exc}"
+            )
+            return None
+        return tickers[0] if tickers else None
+
+    return list(await asyncio.gather(*(one(c) for c in contracts)))
 
 
 def chunked(seq: Sequence, size: int):

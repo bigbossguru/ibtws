@@ -9,7 +9,7 @@ import pandas as pd
 from ib_async import Contract, Option, Ticker
 
 from ibtws.unofficial.client import IBKRClient
-from ibtws.unofficial.helpers import chunked, safe_pick_value
+from ibtws.unofficial.helpers import chunked, safe_pick_value, snapshot_each
 
 from .models import ChainDefinition, OptionQuote
 from .utils import (
@@ -282,7 +282,10 @@ class OptionChainFetcher:
                 ib.reqMktData(c, genericTickList="100,101,104,106")
                 subscribed.append(c)
             await asyncio.sleep(_SETTLE_SECS)
-            tickers = await asyncio.wait_for(ib.reqTickersAsync(*contracts), timeout=self._snapshot_timeout)
+            # Per-contract snapshots: one unsubscribed or erroring contract
+            # no longer drops the whole batch.
+            snapshots = await snapshot_each(ib, contracts, timeout=self._snapshot_timeout)
+            tickers = [t for t in snapshots if t is not None]
         finally:
             for c in subscribed:
                 try:

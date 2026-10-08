@@ -113,6 +113,7 @@ Small stateless utilities shared across the unofficial layer.
 | `days_to_expiry(expiry, *, now=None) -> int` | Calendar days to expiry counted in America/New_York. A same-day expiry is `0` until the 16:00 ET close and `-1` after it, independent of the host's timezone |
 | `expiry_close(expiry) -> datetime` | 16:00 America/New_York on the expiry date |
 | `market_now(now=None)`, `parse_expiry(expiry)` | Exchange-time clock and `YYYYMMDD` / `YYYYMM` parser |
+| `async snapshot_each(ib, contracts, *, timeout, **kwargs) -> list[Ticker \| None]` | One `reqTickersAsync` per contract, run concurrently. A contract IB errors on (e.g. 10090 "not subscribed") or that times out yields `None` without losing the others' quotes. Used by the fetcher, `current_pnl` and the strategy |
 | `MARKET_TZ`, `MARKET_CLOSE` | `ZoneInfo("America/New_York")`, `time(16, 0)` |
 | `chunked(seq, size)` | Yield successive `size`-length slices of a sequence |
 
@@ -215,9 +216,10 @@ Selection precedence for both expirations and strikes: an explicit whitelist
 Quotes with no `bid`, `ask` and `iv` are dropped before returning.
 
 Market-data subscriptions are opened and cancelled inside each snapshot batch
-(subscribe → settle 0.2 s → `reqTickersAsync` bounded by `snapshot_timeout` →
-cancel in `finally`), so subscriptions are released even when a snapshot fails
-or times out. Spot for the strike window comes from a plain snapshot
+(subscribe → settle 0.2 s → one snapshot per contract via `snapshot_each`,
+bounded by `snapshot_timeout` → cancel in `finally`), so subscriptions are
+released even when a snapshot fails or times out, and one unsubscribed
+contract only drops its own quote. Spot for the strike window comes from a plain snapshot
 (`Ticker.marketPrice()`, then last / close / mid).
 
 ### `option.iv_rank.IVRankCalculator`
@@ -385,7 +387,7 @@ OrderManager(
 |---|---|
 | `async start() -> ReconciliationReport` | Binds IB events; raises `RuntimeError` if `managedAccounts` is empty or the primary account is live without `allow_live=True`. Rehydrates `TrackedOrder` for UUIDs that matched the reconciler. Seeds the position cache + live `Contract` refs. Starts the background persist worker and registers `resync` as a reconnect listener. If anything fails after events are bound, they are unbound again |
 | `async stop()` | Unbinds IB events, drains the persist queue, cancels the worker, ends `events()` streams. Idempotent |
-| `async resync()` | After a reconnect: refresh positions and replay the latest status of every tracked order, so fills/cancels that happened while disconnected reach subscribers |
+| `async resync()` | After a reconnect: refresh positions, replay executions ib_async fetched at reconnect as `Filled` events (it does not emit `execDetailsEvent` for them; already-seen exec ids are skipped), and replay the latest status of every tracked order, so fills/cancels that happened while disconnected reach subscribers |
 
 #### Placement (persist-first)
 
@@ -415,7 +417,7 @@ OrderManager(
 |---|---|
 | `open_orders` | List of non-terminal `TrackedOrder` |
 | `positions` | List of cached `PositionChanged` |
-| `async current_pnl(con_ids=None, *, snapshot_timeout=5.0) -> list[PositionPnL]` | On-demand mark-to-market. Pricing rule: mid > last > close. `None` = unknown, never `0.0`. Skips zero-quantity positions |
+| `async current_pnl(con_ids=None, *, snapshot_timeout=5.0) -> list[PositionPnL]` | On-demand mark-to-market, one snapshot per position. Pricing rule: mid > last > close. `None` = unknown (e.g. no market-data subscription for that contract), never `0.0`. Skips zero-quantity positions |
 | `events() -> AsyncIterator[OrderEvent]` | Independent stream from the monitor (each call is its own subscriber) |
 | `on_event(fn)` | Sync callback registration |
 
@@ -696,6 +698,19 @@ was never sent and can decide whether to re-submit or drop it.
 - The persist worker logs store failures instead of raising, so the event
   bus still publishes.
 - `current_pnl` — a missing quote yields `None` fields, never a fabricated 0.
+
+### Live verification
+`scripts/live_paper_check.py` runs the whole stack against a real TWS / IB
+Gateway **paper** session (it refuses live accounts): order lifecycle, IB
+rejections, brackets, `close_position`, restart rehydration, disconnect /
+reconnect with resync, quote resubscription, and the credit-spread strategy's
+entry / take-profit / stop-loss / chase exits on today's SPXW 0DTE chain.
+Pre-existing positions are left untouched. Run it during US regular trading
+hours:
+
+```bash
+TWS_HOST=127.0.0.1 TWS_PORT=7497 TWS_CLIENT_ID=27 poetry run python scripts/live_paper_check.py
+```
 
 ### Rate limiting
 ib_async throttles every outgoing message to 45/s per connection, which keeps

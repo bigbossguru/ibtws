@@ -379,9 +379,8 @@ async def test_streams_are_reference_counted_and_resubscribed(strat, fake_client
 async def test_require_live_quotes_rejects_frozen_data(strat, fake_client):
     plan = _plan(strat, require_live_quotes=True)
     short_c, long_c = plan.short_leg.quote.contract, plan.long_leg.quote.contract
-    fake_client.ib.reqTickersAsync = AsyncMock(
-        return_value=[_ticker(short_c, 1.10, 1.30, data_type=2), _ticker(long_c, 0.70, 0.90, data_type=2)]
-    )
+    frozen = {150: _ticker(short_c, 1.10, 1.30, data_type=2), 145: _ticker(long_c, 0.70, 0.90, data_type=2)}
+    fake_client.ib.reqTickersAsync = AsyncMock(side_effect=lambda c, **_kw: [frozen[c.conId]])
     assert await strat.current_mid_debit(plan) is None
 
 
