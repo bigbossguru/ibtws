@@ -43,6 +43,8 @@ commit_parsers = [
   { message = "^chore\\(release\\):",       skip = true },
   { message = "^chore",                      group = "Chores" },
   { message = "^style",                      skip = true },
+  # Merge commits only repeat the merged PR's own commits.
+  { message = "^Merge (pull request|branch|remote-tracking branch)", skip = true },
   # Fallbacks for non-conventional commit styles used in this repo
   { message = "^(?i)fix[: ]",                group = "Bug Fixes" },
   { message = "^(?i)refactor[: ]",           group = "Refactoring" },
