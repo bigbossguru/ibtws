@@ -7,9 +7,17 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional, Sequence
 
-from .models import OrderState, PositionSnapshot, RequestSubmitted, StatusChanged, serialise_contract
+from .models import (
+    Cancelled,
+    OrderState,
+    PositionSnapshot,
+    Rejected,
+    RequestSubmitted,
+    StatusChanged,
+    serialise_contract,
+)
 from .store import OrderStore
 
 logger = logging.getLogger(__name__)
@@ -28,16 +36,24 @@ class ReconciliationReport:
     positions: list[PositionSnapshot] = field(default_factory=list)
 
 
-async def reconcile(client: Any, store: OrderStore) -> ReconciliationReport:
+async def reconcile(
+    client: Any,
+    store: OrderStore,
+    *,
+    positions: Optional[Sequence[Any]] = None,
+) -> ReconciliationReport:
     """Diff IB's open orders + positions against the local jsonl log.
 
     Returns a report — never mutates IB or the store. The manager rehydrates
     its in-memory ``TrackedOrder`` map from the ``matched`` set; ``ib_only``
     orders are surfaced as warnings (they exist in IB but we don't know what
     UUID they came from, e.g. submitted from the TWS UI or a prior client).
+
+    ``positions`` lets a caller that already fetched ``reqPositionsAsync``
+    reuse that result instead of asking IB twice.
     """
     open_trades = await client.ib.reqOpenOrdersAsync()
-    positions_raw = await client.ib.reqPositionsAsync()
+    positions_raw = positions if positions is not None else await client.ib.reqPositionsAsync()
 
     local_latest: dict[str, str] = {}
     for event in store.replay():
@@ -48,6 +64,12 @@ async def reconcile(client: Any, store: OrderStore) -> ReconciliationReport:
             local_latest[uuid] = OrderState.PENDING_SUBMIT.value
         elif isinstance(event, StatusChanged):
             local_latest[uuid] = event.state
+        elif isinstance(event, Rejected) and event.reason != OrderState.INACTIVE.value:
+            # "Inactive" rejections can revive; only hard rejections (e.g. a
+            # placeOrder that raised) close the order locally.
+            local_latest[uuid] = OrderState.REJECTED.value
+        elif isinstance(event, Cancelled):
+            local_latest[uuid] = OrderState.CANCELLED.value
 
     local_open = {uuid for uuid, state in local_latest.items() if state not in _TERMINAL_STATES}
     ib_uuids = {t.order.orderRef for t in open_trades if getattr(t.order, "orderRef", None)}

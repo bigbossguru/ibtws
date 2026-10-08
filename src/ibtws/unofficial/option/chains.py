@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Iterable, Sequence
 
 import pandas as pd
@@ -20,15 +21,59 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# Snapshots in a batch run concurrently and each batch takes roughly the same
+# few seconds regardless of size, so fewer, larger batches are faster. 100
+# stays well inside what a default TWS session accepts (verified live with
+# 150 contracts per batch without error 101).
 _SNAPSHOT_BATCH = 100
+_QUALIFY_BATCH = 100
 _SETTLE_SECS = 0.2
+_DEFAULT_SNAPSHOT_TIMEOUT = 30.0
+_DEFAULT_CHAIN_TTL = 900.0
+
+_QualifyKey = tuple[str, str, float, str, str, str, str, str]
+
+
+def _qualify_key(c: Option) -> _QualifyKey:
+    return (
+        c.symbol,
+        c.lastTradeDateOrContractMonth,
+        float(c.strike),
+        c.right,
+        c.exchange,
+        c.tradingClass,
+        c.multiplier,
+        c.currency,
+    )
 
 
 class OptionChainFetcher:
-    """Fetch option chain definitions and live snapshots from IB."""
+    """Fetch option chain definitions and live snapshots from IB.
 
-    def __init__(self, client: IBKRClient) -> None:
+    Chain definitions are cached for ``chain_cache_ttl`` seconds and
+    qualified option contracts for the life of the fetcher, so repeated plans
+    on the same underlying (e.g. a scheduler building spreads every few
+    minutes) skip the slow ``reqSecDefOptParams`` / ``qualifyContracts``
+    round-trips. Pass ``chain_cache_ttl=0`` to disable the definition cache.
+    """
+
+    def __init__(
+        self,
+        client: IBKRClient,
+        *,
+        chain_cache_ttl: float = _DEFAULT_CHAIN_TTL,
+        snapshot_timeout: float = _DEFAULT_SNAPSHOT_TIMEOUT,
+    ) -> None:
         self._client = client
+        self._chain_ttl = chain_cache_ttl
+        self._snapshot_timeout = snapshot_timeout
+        self._chain_cache: dict[tuple, tuple[float, ChainDefinition]] = {}
+        self._qualified: dict[_QualifyKey, Option] = {}
+
+    def clear_cache(self) -> None:
+        """Drop cached chain definitions and qualified contracts."""
+        self._chain_cache.clear()
+        self._qualified.clear()
 
     async def fetch_chain_definition(
         self,
@@ -40,6 +85,11 @@ class OptionChainFetcher:
         """Return the option universe (expirations + strikes) for an underlying."""
         if not underlying.conId:
             raise ValueError("Underlying contract must be qualified (conId is required).")
+
+        key = (underlying.conId, exchange, trading_class)
+        cached = self._chain_cache.get(key)
+        if cached is not None and self._chain_ttl > 0 and time.monotonic() - cached[0] < self._chain_ttl:
+            return cached[1]
 
         params = await self._client.ib.reqSecDefOptParamsAsync(
             underlyingSymbol=underlying.symbol,
@@ -56,8 +106,13 @@ class OptionChainFetcher:
             return True
 
         chosen = next((p for p in params if _match(p)), None)
-        if chosen is None and trading_class is None:
-            chosen = params[0] if params else None
+        if chosen is None and trading_class is None and params:
+            chosen = params[0]
+            logger.warning(
+                f"OptionChainFetcher: no {exchange} chain for {underlying.symbol}; "
+                f"falling back to {chosen.exchange}/{chosen.tradingClass}. "
+                f"Pass exchange= / trading_class= explicitly to avoid surprises."
+            )
         if chosen is None:
             raise LookupError(
                 f"No option parameters returned for {underlying.symbol} "
@@ -73,6 +128,8 @@ class OptionChainFetcher:
             expirations=tuple(sorted(chosen.expirations)),
             strikes=tuple(sorted(chosen.strikes)),
         )
+        if self._chain_ttl > 0:
+            self._chain_cache[key] = (time.monotonic(), definition)
         logger.info(
             f"OptionChainFetcher: chain for {underlying.symbol} @ {chosen.exchange} "
             f"({len(definition.expirations)} expiries × {len(definition.strikes)} strikes)"
@@ -177,45 +234,71 @@ class OptionChainFetcher:
     # ------------------------------------------------------------------
 
     async def _qualify(self, contracts: list[Option]) -> list[Option]:
-        """Qualify in parallel batches, silently dropping invalid contracts."""
-        ib = self._client.ib
-        prev = ib.RaiseRequestErrors
-        ib.RaiseRequestErrors = False
-        try:
-            results = await asyncio.gather(
-                *[ib.qualifyContractsAsync(*batch) for batch in chunked(contracts, _SNAPSHOT_BATCH)],
-                return_exceptions=True,
-            )
-        finally:
-            ib.RaiseRequestErrors = prev
+        """Qualify in parallel batches, silently dropping invalid contracts.
 
-        resolved: list[Option] = []
-        for r in results:
-            if isinstance(r, BaseException):
-                logger.warning(f"OptionChainFetcher: qualify batch failed: {r}")
-            else:
-                resolved.extend(c for c in r if getattr(c, "conId", 0))
+        Contracts qualified earlier by this fetcher are served from cache.
+        """
+        # Keys are taken before qualifying: IB fills fields in place (e.g.
+        # tradingClass), which would otherwise change the key under us.
+        keys = [_qualify_key(c) for c in contracts]
+        missing = [(k, c) for k, c in zip(keys, contracts) if k not in self._qualified]
+        if missing:
+            ib = self._client.ib
+            prev = ib.RaiseRequestErrors
+            ib.RaiseRequestErrors = False
+            try:
+                results = await asyncio.gather(
+                    *[ib.qualifyContractsAsync(*(c for _, c in batch)) for batch in chunked(missing, _QUALIFY_BATCH)],
+                    return_exceptions=True,
+                )
+            finally:
+                ib.RaiseRequestErrors = prev
 
+            for batch, r in zip(chunked(missing, _QUALIFY_BATCH), results):
+                if isinstance(r, BaseException):
+                    logger.warning(f"OptionChainFetcher: qualify batch failed: {r}")
+                    continue
+                # ib_async returns results positionally, with None for failures.
+                for (key, _), qualified in zip(batch, r):
+                    if getattr(qualified, "conId", 0):
+                        self._qualified[key] = qualified
+
+        resolved = [self._qualified[k] for k in keys if k in self._qualified]
         dropped = len(contracts) - len(resolved)
         if dropped:
             logger.info(f"OptionChainFetcher: dropped {dropped} unresolved contract(s)")
         return resolved
 
     async def _request_tickers(self, contracts: list[Option]) -> list[Ticker]:
-        """Subscribe, wait, snapshot, cancel."""
+        """Subscribe, wait, snapshot, cancel.
+
+        The streaming subscriptions are always cancelled, even when the
+        snapshot fails or times out, so market-data lines never leak.
+        """
         ib = self._client.ib
-        for c in contracts:
-            ib.reqMktData(c, genericTickList="100,101,104,106")
-        await asyncio.sleep(_SETTLE_SECS)
-        tickers = await ib.reqTickersAsync(*contracts)
-        for c in contracts:
-            ib.cancelMktData(c)
+        subscribed: list[Option] = []
+        try:
+            for c in contracts:
+                ib.reqMktData(c, genericTickList="100,101,104,106")
+                subscribed.append(c)
+            await asyncio.sleep(_SETTLE_SECS)
+            tickers = await asyncio.wait_for(ib.reqTickersAsync(*contracts), timeout=self._snapshot_timeout)
+        finally:
+            for c in subscribed:
+                try:
+                    ib.cancelMktData(c)
+                except Exception:  # noqa: BLE001
+                    logger.exception(f"OptionChainFetcher: cancelMktData failed for conId={getattr(c, 'conId', 0)}")
         return list(tickers)
 
     async def _fetch_spot(self, underlying: Contract) -> float | None:
-        """Best-effort spot price."""
-        t = await self._client.get_market_data(underlying)
-        for attr in ("marketPrice", "last", "close"):
+        """Best-effort spot price from a plain snapshot (no generic ticks, no settle wait)."""
+        t = await self._client.get_market_data(underlying, generic_ticks="", settle=0.0)
+        if isinstance(t, Ticker):
+            market_price = t.marketPrice()  # last within the spread, else mid, else close
+            if market_price == market_price and market_price > 0:
+                return float(market_price)
+        for attr in ("last", "close"):
             v = safe_pick_value(t, attr)
             if v is not None:
                 return v

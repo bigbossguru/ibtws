@@ -40,6 +40,12 @@ class OptionQuote:
     theta: float | None = None
     underlying_price: float | None = None
 
+    # IB market data type of the ticker: 1 live, 2 frozen, 3 delayed,
+    # 4 delayed-frozen. Anything but 1 can be minutes or hours old.
+    market_data_type: int | None = None
+
+    # Epoch seconds of the last tick IB delivered for this contract (falls
+    # back to construction time when the ticker carries no time).
     timestamp: float = field(default_factory=time.time)
 
 

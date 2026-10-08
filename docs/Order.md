@@ -36,7 +36,7 @@ from ib_async import Stock
 from ibtws.config import IBKRConfig
 from ibtws.unofficial.client import IBKRClient
 from ibtws.unofficial.order import (
-    JsonStore, OrderManager, OrderSide, TimeInForce
+    JsonStore, OrderManager, OrderSide, OrderState, TimeInForce
 )
 
 async def main():
@@ -59,11 +59,13 @@ async def main():
         # Place a limit order
         tracked = await manager.limit(contract, OrderSide.BUY, 10, 150.0)
 
-        # Cancel
+        # Cancel and wait for IB to confirm
         await manager.cancel(tracked.uuid)
+        await manager.wait_for(lambda: tracked.state == OrderState.CANCELLED, timeout=10)
 
-        # Flatten all positions
-        await manager.close_all_positions()
+        # Flatten this contract only (close_all_positions() without filters
+        # would close every position on the account)
+        await manager.close_all_positions(con_ids=[contract.conId])
 
         await manager.stop()
 ```
@@ -230,11 +232,16 @@ cancelled_uuids = await manager.cancel_all()
 # Refresh from IB (positionEvent can lag fills by seconds)
 positions = await manager.refresh_positions()
 
-# Close one position by conId
+# Close one position by conId. Working orders on the contract (including
+# combos that have it as a leg) are cancelled first and the cancels are
+# awaited; RuntimeError if IB does not confirm them within cancel_timeout.
 await manager.close_position(con_id=12345, kind="market")
 await manager.close_position(con_id=12345, kind="limit", limit_price=150.0)
 
-# Flatten everything (refreshes first, cancels working orders per contract)
+# Flatten selected contracts (refreshes first, cancels working orders per contract)
+closed = await manager.close_all_positions(con_ids=[12345, 67890])
+
+# Flatten EVERY position on every account the session sees
 closed = await manager.close_all_positions()
 ```
 
@@ -271,8 +278,16 @@ async for event in manager.events():
         print(f"Fill: {event.uuid} @ {event.price}")
 ```
 
-Note: the stream uses a single queue — only one consumer can use `events()`.
-For multiple consumers, use `on_event()` callbacks.
+Each `events()` call is an independent subscriber with its own bounded queue,
+so several consumers can stream side by side. `manager.stop()` ends the
+streams.
+
+### Waiting for a state
+
+```python
+# Wakes on every IB event instead of polling
+filled = await manager.wait_for(lambda: tracked.state == OrderState.FILLED, timeout=30)
+```
 
 ### Event Types
 
@@ -280,9 +295,9 @@ For multiple consumers, use `on_event()` callbacks.
 |-------|--------|------|
 | `RequestSubmitted` | uuid, contract, side, quantity, tif, extra | Order persisted + sent to IB |
 | `StatusChanged` | uuid, state, filled, remaining, avg_fill_price | Any IB status update |
-| `Filled` | uuid, exec_id, price, quantity | Each execution (partial or full) |
+| `Filled` | uuid, exec_id, price, quantity, con_id, sec_type | Each execution (partial or full); combo orders report one per leg |
 | `Cancelled` | uuid, perm_id | Order cancelled |
-| `Rejected` | uuid, reason | Order rejected or inactive |
+| `Rejected` | uuid, reason | IB rejected the order (error 201/203/10147 → state REJECTED), `placeOrder` raised, or the order went Inactive (state stays INACTIVE and cancellable) |
 | `PositionChanged` | account, contract, quantity, avg_cost | Position update from IB |
 | `LegMismatch` | uuid, expected, actual, detail | Combo/bracket position mismatch |
 
@@ -291,7 +306,9 @@ For multiple consumers, use `on_event()` callbacks.
 ### Audit Log
 
 Every event is appended to the `OrderStore` as a single JSON line, flushed and
-fsync'd before the write returns. A crash loses at most the line being written.
+fsync'd (in a worker thread) before the write returns. A crash loses at most
+the line being written: that unfinished last line is skipped on replay and
+truncated before the next append.
 
 ```python
 store = JsonStore("orders.jsonl", fsync=True)  # fsync=False for tests
@@ -327,18 +344,32 @@ report.positions    # Current position snapshots
 Matched orders are rehydrated into `TrackedOrder` objects so `cancel()` and
 `open_orders` work immediately after restart.
 
+## Reconnects
+
+`IBKRClient` reconnects on its own after an unexpected drop (TWS daily
+restart, network loss) and then calls `manager.resync()`, which refreshes
+positions and replays the latest IB status of every tracked order, so fills
+and cancels that happened while disconnected still reach subscribers.
+
 ## Rate Limiting
 
-The manager uses a `ThrottledExecutor` (token-bucket + semaphore) to stay under
-IB's ~50 msg/s ceiling. Default: 10 msg/s with 10 concurrent slots.
+ib_async already throttles every outgoing message to 45/s per connection,
+which keeps the session under IB's ~50 msg/s ceiling. The manager adds a
+`ThrottledExecutor` with 10 concurrent slots and no pacing by default; cancels
+bypass it.
 
 ```python
 from ibtws.unofficial._pacing import ThrottledExecutor
 
-# Share one executor across order manager and chain fetcher
-executor = ThrottledExecutor(max_concurrency=10, pace_per_sec=40.0)
+# Deliberately slow order placement down further
+executor = ThrottledExecutor(max_concurrency=10, pace_per_sec=5.0)
 manager = OrderManager(client, store, executor=executor)
 ```
+
+## Readonly sessions
+
+With `IBKRConfig(readonly=True)` every place / cancel call raises
+`RuntimeError` before anything is sent to IB.
 
 ## Lifecycle
 
@@ -346,7 +377,7 @@ manager = OrderManager(client, store, executor=executor)
 manager = OrderManager(client, store)
 report = await manager.start()   # bind events, reconcile, start persist worker
 # ... use manager ...
-await manager.stop()             # unbind events, drain persist queue, stop worker
+await manager.stop()             # unbind events, drain persist queue, stop worker, end streams
 ```
 
 `stop()` guarantees all pending events are flushed to disk before returning.

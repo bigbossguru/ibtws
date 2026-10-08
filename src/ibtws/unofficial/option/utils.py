@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Iterable, Optional, Sequence
 
 import pandas as pd
@@ -55,7 +56,23 @@ def _ticker_to_quote(ticker: Ticker, underlying_price: Optional[float] = None) -
         vega=safe_pick_value(greeks, "vega") if greeks else None,
         theta=safe_pick_value(greeks, "theta", allow_negative=True) if greeks else None,
         underlying_price=underlying_price,
+        market_data_type=_market_data_type(ticker),
+        timestamp=_tick_time(ticker),
     )
+
+
+def _tick_time(ticker: Ticker) -> float:
+    """Epoch seconds of the ticker's last update, or now when unknown."""
+    t = getattr(ticker, "time", None)
+    try:
+        return float(t.timestamp()) if t is not None else time.time()
+    except (AttributeError, TypeError, ValueError, OSError):
+        return time.time()
+
+
+def _market_data_type(ticker: Ticker) -> Optional[int]:
+    value = getattr(ticker, "marketDataType", None)
+    return value if isinstance(value, int) else None
 
 
 DATAFRAME_COLUMNS = (

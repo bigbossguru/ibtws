@@ -8,9 +8,10 @@
   expirations. The plain ``SPX`` series is AM-settled monthly and will not
   include today's expiry.
 * ``target_dte=0`` + ``dte_tolerance=0`` forces an exact same-day match.
-  If today's SPXW expiry is missing from the chain (rare — early close,
-  pre-market run, holiday) the build raises ``CreditSpreadError`` instead
-  of silently falling back to tomorrow.
+  DTE is counted in exchange time (America/New_York): today's expiry stays
+  0 DTE until the 16:00 ET close wherever this script runs. If today's SPXW
+  expiry is missing from the chain (holiday, pre-listing run) the build
+  raises ``CreditSpreadError`` instead of silently falling back to tomorrow.
 * Short delta around 0.05–0.15 is typical: 0DTE gamma is enormous, so you
   trade further OTM than a 30 DTE spread of equivalent risk.
 * Wing widths of 5–25 are typical on SPX. We use 10 here.
@@ -18,6 +19,12 @@
   50 % decay before assignment risk dominates.
 * Strict ``min_credit_width_ratio`` rejects spreads whose mid credit is so
   thin the slippage round-trip would eat the edge.
+* Trading decisions need live quotes. ``LIVE_QUOTES=True`` requests market
+  data type 1 and makes the strategy refuse frozen or delayed quotes; set it
+  to False only to build plans outside market hours.
+
+Connection details come from ``IBKR_HOST`` / ``IBKR_PORT`` / ``IBKR_CLIENT_ID``
+(see :meth:`IBKRConfig.from_env`).
 
 CAUTION: this places real-money risk on a paper account by default. Read
 every line before uncommenting the ``strat.place(plan)`` block.
@@ -27,13 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time
 from pathlib import Path
 
 from ib_async import Index
 
 from ibtws.config import IBKRConfig
 from ibtws.unofficial.client import IBKRClient
+from ibtws.unofficial.helpers import MARKET_TZ
 from ibtws.unofficial.option import OptionChainFetcher
 from ibtws.unofficial.order import JsonStore, OrderManager
 from ibtws.unofficial.strategies import (
@@ -45,14 +53,16 @@ from ibtws.unofficial.strategies import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 
+LIVE_QUOTES = True  # False → frozen data (type 2), only for building plans outside RTH
+FLATTEN_AT_ET = time(15, 55)  # close whatever is still open before the 16:00 ET expiry
+
 
 async def main() -> None:
-    config = IBKRConfig(host="192.168.0.129", port=7497, client_id=14)  # TWS paper
+    config = IBKRConfig.from_env(client_id=14)  # defaults to TWS paper on 127.0.0.1:7497
     store = JsonStore(Path(__file__).parent / "orders.jsonl")
 
     async with IBKRClient(config) as client:
-        await client.connect()
-        client.ib.reqMarketDataType(2)  # delayed-frozen — fine for paper / outside RTH
+        client.ib.reqMarketDataType(1 if LIVE_QUOTES else 2)
 
         underlying = Index("SPX", "CBOE", "USD")
         [underlying] = await client.ib.qualifyContractsAsync(underlying)
@@ -60,17 +70,15 @@ async def main() -> None:
         manager = OrderManager(client, store)
         await manager.start()
 
-        # Tight freshness window — 0DTE moves fast and stale option quotes
-        # mis-price the spread. The fetcher drops tickers older than this
-        # before they reach the selector.
         fetcher = OptionChainFetcher(client)
         strat = CreditSpreadStrategy(client, manager, fetcher=fetcher)
 
-        # Belt-and-braces: pin the expiry to today's date string. Combined
-        # with target_dte=0/dte_tolerance=0 this gives a tight, single-day
-        # selection window — if today's SPXW expiry is not yet listed (e.g.
-        # over a long weekend) the build fails loud.
-        today = (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
+        # Belt-and-braces: pin the expiry to today's date in exchange time.
+        # Combined with target_dte=0/dte_tolerance=0 this gives a tight,
+        # single-day selection window — if today's SPXW expiry is not listed
+        # the build fails loud.
+        now_et = datetime.now(MARKET_TZ)
+        today = now_et.strftime("%Y%m%d")
 
         params = CreditSpreadParams(
             underlying=underlying,
@@ -92,6 +100,7 @@ async def main() -> None:
             quantity=1,
             min_open_interest=100,  # avoid stale strikes
             outside_rth=True,
+            require_live_quotes=LIVE_QUOTES,
         )
 
         try:
@@ -118,17 +127,19 @@ async def main() -> None:
         # tracked = await strat.place(plan)
         # print(f"placed uuid={tracked.uuid} state={tracked.state}")
         #
-        # # 0DTE: poll mid every 30s. Hard ceiling of 5 hours covers a full
-        # # session start-to-finish; the monitor will exit early on TP or SL.
-        # closed = await strat.monitor_and_exit(
-        #     plan, tracked, poll_interval=30.0, max_wait=5 * 3600
-        # )
+        # # Manage until TP / SL, or until 15:55 ET. When the deadline passes
+        # # with the spread still open, monitor_and_exit closes it as one combo
+        # # (escalating to a marketable price) — the entry is cancelled if it
+        # # never filled, and a partial fill is managed at its filled size.
+        # flatten_at = datetime.combine(now_et.date(), FLATTEN_AT_ET, tzinfo=MARKET_TZ)
+        # budget = max((flatten_at - datetime.now(MARKET_TZ)).total_seconds(), 0)
+        # closed = await strat.monitor_and_exit(plan, tracked, poll_interval=2.0, max_wait=budget)
         # if closed:
         #     print(f"closed uuid={closed.uuid} state={closed.state}")
-        # else:
-        #     # No TP/SL hit by EOD — flatten so the position doesn't pin/assign.
-        #     print("no TP/SL hit; flattening before expiry")
-        #     await manager.close_all_positions()
+        #
+        # # Backstop: flatten only this spread's legs, never the whole account.
+        # legs = [plan.short_leg.conId, plan.long_leg.conId]
+        # await manager.close_all_positions(con_ids=legs)
 
         await manager.stop()
 

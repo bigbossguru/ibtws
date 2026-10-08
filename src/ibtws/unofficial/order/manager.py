@@ -9,8 +9,9 @@ Responsibilities:
   ``positionEvent``) and funnel them into typed :class:`OrderEvent`s.
 * Persist every state transition to the :class:`OrderStore`.
 * Publish events to the :class:`OrderMonitor` for downstream consumers.
-* Reconcile against IB on ``start()`` (IB is the source of truth).
-* Enforce the paper-vs-live safety interlock.
+* Reconcile against IB on ``start()`` (IB is the source of truth) and resync
+  after every reconnect.
+* Enforce the paper-vs-live safety interlock and the ``readonly`` config flag.
 
 The manager is the only stateful class in the package; everything else is a
 pure dataclass, pure function, or thin I/O wrapper.
@@ -20,11 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from ib_async import Contract
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Callable, Optional, Sequence
+from typing import Any, AsyncIterator, Callable, Iterable, Optional, Sequence
 
 from ibtws.unofficial._pacing import ThrottledExecutor
 
@@ -76,6 +78,23 @@ _IB_STATUS_TO_STATE = {
     "Inactive": OrderState.INACTIVE,
 }
 
+_TERMINAL_STATES = frozenset({OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED})
+
+# IB error codes that mean "this order is not live at IB". They arrive on the
+# error channel, often after the order already shows Inactive, so ib_async
+# leaves the status at Inactive; we close the order out locally instead.
+#   201   Order rejected (no trading permission, margin, KID/MiFID, ...)
+#   203   Security not available or not allowed for this account
+#   10147 OrderId to cancel not found (IB has no such live order)
+_ORDER_REJECT_CODES = frozenset({201, 203, 10147})
+
+# Bound on the execId dedup cache; IB only replays the current session's fills.
+_MAX_SEEN_EXEC_IDS = 50_000
+
+# Upper bound for one wait slice in wait_for(), so state changed outside the
+# IB event handlers (tests, manual edits) is still noticed.
+_WAIT_RECHECK_SECS = 1.0
+
 
 class OrderManager:
     """Place orders, track their lifecycle, persist state, expose events."""
@@ -87,9 +106,14 @@ class OrderManager:
         *,
         allow_live: bool = False,
         max_concurrency: int = 10,
-        pace_per_sec: float = 10.0,
+        pace_per_sec: float = 0.0,
         executor: Optional[ThrottledExecutor] = None,
     ) -> None:
+        """
+        ``pace_per_sec`` defaults to 0 (no extra pacing): ib_async already
+        throttles every outgoing message to 45/s per connection. Set it only
+        to deliberately slow order placement further.
+        """
         self._client = client
         self._store = store
         self._allow_live = allow_live
@@ -109,8 +133,12 @@ class OrderManager:
         self._position_contracts: dict[int, Any] = {}
 
         # IB can replay execDetails on reconnect; dedup so downstream consumers
-        # don't see the same fill twice (would re-fire exit logic).
-        self._seen_exec_ids: set[str] = set()
+        # don't see the same fill twice (would re-fire exit logic). Bounded LRU.
+        self._seen_exec_ids: OrderedDict[str, None] = OrderedDict()
+
+        # Swapped and set on every IB event so wait_for() can sleep until
+        # something actually changes instead of polling.
+        self._update = asyncio.Event()
 
         self._executor = executor or ThrottledExecutor(max_concurrency=max_concurrency, pace_per_sec=pace_per_sec)
 
@@ -126,7 +154,8 @@ class OrderManager:
         """Bind IB events, run reconciliation, return the divergence report.
 
         Raises ``RuntimeError`` if the connected account is live and
-        ``allow_live`` was not explicitly set.
+        ``allow_live`` was not explicitly set. If anything fails after the IB
+        events are bound, they are unbound again so a retry starts clean.
         """
         if self._started:
             raise RuntimeError("OrderManager already started.")
@@ -149,61 +178,70 @@ class OrderManager:
         # per-request account routing can be policed in place() / place_bracket().
         self._managed_accounts = tuple(accounts)
 
-        self._client.ib.orderStatusEvent += self._on_order_status
-        self._client.ib.execDetailsEvent += self._on_exec_details
-        self._client.ib.positionEvent += self._on_position
+        self._bind_events()
+        try:
+            positions_raw = await self._client.ib.reqPositionsAsync()
+            report = await reconcile(self._client, self._store, positions=positions_raw)
 
-        report = await reconcile(self._client, self._store)
+            # Rehydrate tracked orders for matched UUIDs so cancel/inspect works
+            # post-restart without an extra explicit hydration step.
+            open_trades = {
+                t.order.orderRef: t for t in self._client.ib.openTrades() if getattr(t.order, "orderRef", None)
+            }
+            for uuid in report.matched:
+                trade = open_trades.get(uuid)
+                if trade is None:
+                    continue
+                self._tracked[uuid] = TrackedOrder(
+                    uuid=uuid,
+                    request=None,  # original request not recoverable; the audit log carries it
+                    trade=trade,
+                    state=_IB_STATUS_TO_STATE.get(trade.orderStatus.status, OrderState.SUBMITTED),
+                    filled=float(trade.orderStatus.filled or 0.0),
+                    remaining=float(trade.orderStatus.remaining or 0.0),
+                    avg_fill_price=float(trade.orderStatus.avgFillPrice or 0.0),
+                    perm_id=int(trade.order.permId or 0),
+                )
 
-        # Rehydrate tracked orders for matched UUIDs so cancel/inspect works
-        # post-restart without an extra explicit hydration step.
-        open_trades = {t.order.orderRef: t for t in self._client.ib.openTrades() if getattr(t.order, "orderRef", None)}
-        for uuid in report.matched:
-            trade = open_trades.get(uuid)
-            if trade is None:
-                continue
-            self._tracked[uuid] = TrackedOrder(
-                uuid=uuid,
-                request=None,  # original request not recoverable; the audit log carries it
-                trade=trade,
-                state=_IB_STATUS_TO_STATE.get(trade.orderStatus.status, OrderState.SUBMITTED),
-                filled=float(trade.orderStatus.filled or 0.0),
-                remaining=float(trade.orderStatus.remaining or 0.0),
-                avg_fill_price=float(trade.orderStatus.avgFillPrice or 0.0),
-                perm_id=int(trade.order.permId or 0),
-            )
+            # Seed position cache.
+            for snap in report.positions:
+                key = (snap.account, snap.contract.get("conId", 0))
+                self._positions[key] = PositionChanged(
+                    account=snap.account,
+                    contract=snap.contract,
+                    quantity=snap.quantity,
+                    avg_cost=snap.avg_cost,
+                    timestamp=snap.timestamp,
+                )
 
-        # Seed position cache.
-        for snap in report.positions:
-            key = (snap.account, snap.contract.get("conId", 0))
-            self._positions[key] = PositionChanged(
-                account=snap.account,
-                contract=snap.contract,
-                quantity=snap.quantity,
-                avg_cost=snap.avg_cost,
-                timestamp=snap.timestamp,
-            )
-
-        # Cache live Contract refs for close_position. reconcile() returns
-        # serialised snapshots only — we need the raw ib_async.Contract
-        # objects to flatten positions without re-qualifying from a dict
-        # (which fails for synthetic contracts like ContFuture).
-        for p in await self._client.ib.reqPositionsAsync():
-            conid = getattr(p.contract, "conId", 0)
-            if conid:
-                self._position_contracts[conid] = p.contract
+            # Cache live Contract refs for close_position. reconcile() returns
+            # serialised snapshots only — we need the raw ib_async.Contract
+            # objects to flatten positions without re-qualifying from a dict
+            # (which fails for synthetic contracts like ContFuture).
+            for p in positions_raw:
+                conid = getattr(p.contract, "conId", 0)
+                if conid:
+                    self._position_contracts[conid] = p.contract
+        except BaseException:
+            self._unbind_events()
+            raise
 
         self._started = True
+        self._monitor.reopen()
         self._persist_task = asyncio.ensure_future(self._persist_worker())
+        add_listener = getattr(self._client, "add_reconnect_listener", None)
+        if callable(add_listener):
+            add_listener(self.resync)
         logger.info(f"OrderManager: started (account={primary}, tracked={len(self._tracked)})")
         return report
 
     async def stop(self) -> None:
         if not self._started:
             return
-        self._client.ib.orderStatusEvent -= self._on_order_status
-        self._client.ib.execDetailsEvent -= self._on_exec_details
-        self._client.ib.positionEvent -= self._on_position
+        remove_listener = getattr(self._client, "remove_reconnect_listener", None)
+        if callable(remove_listener):
+            remove_listener(self.resync)
+        self._unbind_events()
         self._started = False
         # Drain pending persist writes before shutting down.
         if self._persist_task is not None:
@@ -214,7 +252,45 @@ class OrderManager:
             except asyncio.CancelledError:
                 pass
             self._persist_task = None
+        self._monitor.close()
         logger.info("OrderManager: stopped.")
+
+    def _bind_events(self) -> None:
+        self._client.ib.orderStatusEvent += self._on_order_status
+        self._client.ib.execDetailsEvent += self._on_exec_details
+        self._client.ib.positionEvent += self._on_position
+        self._client.ib.errorEvent += self._on_error
+
+    def _unbind_events(self) -> None:
+        self._client.ib.orderStatusEvent -= self._on_order_status
+        self._client.ib.execDetailsEvent -= self._on_exec_details
+        self._client.ib.positionEvent -= self._on_position
+        self._client.ib.errorEvent -= self._on_error
+
+    async def resync(self) -> None:
+        """Bring local state back in line with IB after a reconnect.
+
+        Refreshes positions and replays the latest status of every tracked
+        order that IB knows about, so fills or cancellations that happened
+        while the socket was down reach the tracked orders and subscribers.
+        Registered automatically with :meth:`IBKRClient.add_reconnect_listener`.
+        """
+        if not self._started:
+            return
+        try:
+            await self.refresh_positions()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"OrderManager.resync: position refresh failed: {exc}")
+        for trade in list(self._client.ib.trades()):
+            uuid = getattr(trade.order, "orderRef", None)
+            tracked = self._tracked.get(uuid) if uuid else None
+            if tracked is None:
+                continue
+            tracked.trade = trade
+            new_state = _IB_STATUS_TO_STATE.get(trade.orderStatus.status)
+            if new_state is not None and tracked.state not in _TERMINAL_STATES and new_state != tracked.state:
+                self._on_order_status(trade)
+        logger.info(f"OrderManager: resynced after reconnect (open={len(self.open_orders)})")
 
     # ------------------------------------------------------------------
     # Placement
@@ -225,9 +301,11 @@ class OrderManager:
 
         Persist-first ensures that a crash between persist and submit is
         detectable by the reconciler (local_only entry that IB never saw → we
-        know we never sent it).
+        know we never sent it). If ``placeOrder`` itself raises, a
+        :class:`Rejected` event closes the audit entry and the error propagates.
         """
         self._require_started()
+        self._require_writable()
         validate_request(request)
         self._check_account_safety(getattr(request, "account", None))
         uuid = make_order_ref()
@@ -235,8 +313,14 @@ class OrderManager:
 
         async with self._uuid_lock(uuid):
             await self._store.append(_build_submitted_event(uuid, request))
-            async with self._slot():
-                trade = self._client.ib.placeOrder(request.contract, order)
+            try:
+                async with self._slot():
+                    trade = self._client.ib.placeOrder(request.contract, order)
+            except Exception as exc:
+                # Close the audit entry so reconcile doesn't report a phantom
+                # local-only order on every restart.
+                await self._record_placement_failure([uuid], exc)
+                raise
             tracked = TrackedOrder(
                 uuid=uuid,
                 request=request,
@@ -255,9 +339,10 @@ class OrderManager:
 
         Returns the :class:`TrackedOrder`s sharing a ``bracket_group``: three
         when a stop-loss is present (parent + TP + SL), two for a TP-only
-        bracket (parent + TP).
+        bracket (parent + TP). Every member is persisted before submission.
         """
         self._require_started()
+        self._require_writable()
         validate_request(request)
         self._check_account_safety(getattr(request, "account", None))
         group = make_order_ref()
@@ -274,29 +359,46 @@ class OrderManager:
             oca_group=group,
         )
 
-        # Persist the group submission first.
-        await self._store.append(_build_submitted_event(parent_uuid, request, bracket_group=group))
+        # TP-only brackets yield [parent, tp]; the trailing sl_uuid is unused.
+        uuids = (parent_uuid, tp_uuid, sl_uuid)[: len(orders)]
+        legs = ("parent", "tp", "sl")
 
-        # zip truncates to len(orders): TP-only brackets yield [parent, tp] and
-        # the trailing sl_uuid is simply unused.
-        uuids = (parent_uuid, tp_uuid, sl_uuid)
+        # Persist every member first so reconcile can match each of them.
+        submitted = [
+            _build_submitted_event(uuid, request, bracket_group=group, leg=leg) for uuid, leg in zip(uuids, legs)
+        ]
+        for event in submitted:
+            await self._store.append(event)
+
         tracked_list: list[TrackedOrder] = []
-        async with self._slot():
-            for o, uuid in zip(orders, uuids):
-                trade = self._client.ib.placeOrder(request.contract, o)
-                tracked = TrackedOrder(
-                    uuid=uuid,
-                    request=request,
-                    trade=trade,
-                    state=OrderState.PENDING_SUBMIT,
-                    remaining=request.quantity,
-                    perm_id=int(getattr(trade.order, "permId", 0) or 0),
-                    bracket_group=group,
-                )
-                self._tracked[uuid] = tracked
-                tracked_list.append(tracked)
+        try:
+            async with self._slot():
+                for o, uuid in zip(orders, uuids):
+                    trade = self._client.ib.placeOrder(request.contract, o)
+                    tracked = TrackedOrder(
+                        uuid=uuid,
+                        request=request,
+                        trade=trade,
+                        state=OrderState.PENDING_SUBMIT,
+                        remaining=request.quantity,
+                        perm_id=int(getattr(trade.order, "permId", 0) or 0),
+                        bracket_group=group,
+                    )
+                    self._tracked[uuid] = tracked
+                    tracked_list.append(tracked)
+        except Exception as exc:
+            # Members placed so far were never transmitted (transmit=False until
+            # the last child); cancel them so nothing half-built lingers in TWS.
+            for t in tracked_list:
+                try:
+                    self._client.ib.cancelOrder(t.trade.order)
+                except Exception:  # noqa: BLE001
+                    logger.exception(f"OrderManager: failed to cancel partial bracket member {t.uuid}")
+            await self._record_placement_failure(list(uuids), exc)
+            raise
 
-        self._monitor.publish(_build_submitted_event(parent_uuid, request, bracket_group=group))
+        for event in submitted:
+            self._monitor.publish(event)
         return tracked_list
 
     # ------------------------------------------------------------------
@@ -396,20 +498,57 @@ class OrderManager:
         kind: str = "market",
         limit_price: Optional[float] = None,
         cancel_working: bool = True,
+        refresh: bool = True,
+        account: Optional[str] = None,
+        cancel_timeout: float = 10.0,
     ) -> Optional[TrackedOrder]:
         """Flatten a single position by ``conId``.
 
-        Cancels any working orders on the same contract first (unless
-        ``cancel_working=False``), re-qualifies the contract via IB by
-        ``conId``, then submits an opposite-side market or limit order for
-        ``abs(quantity)``.
+        1. Unless ``cancel_working=False``, cancel every working order that
+           trades this contract — including combo (BAG) orders that have it
+           as a leg and orders rehydrated after a restart — and wait up to
+           ``cancel_timeout`` seconds for IB to confirm. If the cancels are
+           not confirmed the close is refused with ``RuntimeError``: a
+           still-live exit order could fill alongside the closing order and
+           flip the position.
+        2. Re-read positions from IB (``refresh=True`` or after any cancel)
+           so the closing size reflects fills that just happened.
+        3. Submit an opposite-side market or limit order for ``abs(quantity)``.
 
+        ``account`` disambiguates when several accounts hold the contract.
         Returns the new :class:`TrackedOrder`, or ``None`` if no non-zero
         position exists for that ``conId``.
         """
         self._require_started()
+        self._require_writable()
+
+        cancelled_any = False
+        if cancel_working:
+            working = [
+                t for t in self._tracked.values() if t.state not in _TERMINAL_STATES and con_id in _order_con_ids(t)
+            ]
+            if working:
+                await asyncio.gather(*(self.cancel(t.uuid) for t in working))
+                confirmed = await self.wait_for(
+                    lambda: all(t.state in _TERMINAL_STATES for t in working), timeout=cancel_timeout
+                )
+                if not confirmed:
+                    pending = [t.uuid for t in working if t.state not in _TERMINAL_STATES]
+                    raise RuntimeError(
+                        f"close_position: cancellation of working orders {pending} on conId={con_id} "
+                        f"not confirmed within {cancel_timeout}s; refusing to send a closing order."
+                    )
+                cancelled_any = True
+
+        if refresh or cancelled_any:
+            await self.refresh_positions()
+
         pos = next(
-            (p for p in self._positions.values() if p.contract.get("conId") == con_id),
+            (
+                p
+                for p in self._positions.values()
+                if p.contract.get("conId") == con_id and (account is None or p.account == account)
+            ),
             None,
         )
         if pos is None:
@@ -422,32 +561,10 @@ class OrderManager:
             logger.warning(f"close_position: conId={con_id} has zero quantity, nothing to close.")
             return None
 
-        if cancel_working:
-            for t in list(self._tracked.values()):
-                if t.state in (OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED):
-                    continue
-                req_contract = getattr(t.request, "contract", None) if t.request else None
-                if req_contract is not None and getattr(req_contract, "conId", 0) == con_id:
-                    await self.cancel(t.uuid)
-
-        skeleton = self._position_contracts.get(con_id)
-        if skeleton is None:
-            skeleton = Contract(
-                conId=con_id,
-                symbol=pos.contract.get("symbol") or "",
-                secType=pos.contract.get("secType") or "",
-                exchange=pos.contract.get("exchange") or "",
-                currency=pos.contract.get("currency") or "",
-                lastTradeDateOrContractMonth=pos.contract.get("lastTradeDateOrContractMonth") or "",
-                strike=pos.contract.get("strike") or 0.0,
-                right=pos.contract.get("right") or "",
-                multiplier=pos.contract.get("multiplier") or "",
-                tradingClass=pos.contract.get("tradingClass") or "",
-            )
+        contract = self._position_contracts.get(con_id) or _contract_from_position(pos, con_id)
         # Positions from reqPositionsAsync come back with exchange="" — IB
         # refuses orders without a routing destination. qualifyContractsAsync
         # backfills exchange/primaryExchange from conId.
-        contract = skeleton
         if not getattr(contract, "exchange", ""):
             qualified = await self._client.ib.qualifyContractsAsync(contract)
             if not qualified:
@@ -467,15 +584,16 @@ class OrderManager:
         raise ValueError(f"Unsupported close kind: {kind!r} (use 'market' or 'limit')")
 
     async def refresh_positions(self) -> list[PositionChanged]:
-        """Pull fresh positions from IB, update the local cache, return them.
+        """Pull fresh positions from IB, replace the local cache, return them.
 
         Useful right before flattening — ``positionEvent`` from IB can lag
         several seconds after a fill, so the cached ``self.positions`` may be
-        stale or empty.
+        stale or empty. Positions IB no longer reports are dropped.
         """
         self._require_started()
         fresh = await self._client.ib.reqPositionsAsync()
         snapshots: list[PositionChanged] = []
+        positions: dict[tuple, PositionChanged] = {}
         for p in fresh:
             conid = getattr(p.contract, "conId", 0)
             if not conid:
@@ -486,56 +604,123 @@ class OrderManager:
                 quantity=float(p.position),
                 avg_cost=float(p.avgCost),
             )
-            self._positions[(p.account, conid)] = snap
+            positions[(p.account, conid)] = snap
             self._position_contracts[conid] = p.contract
             snapshots.append(snap)
+        self._positions = positions
         return snapshots
 
-    async def close_all_positions(self, *, kind: str = "market", cancel_working: bool = True) -> list[TrackedOrder]:
-        """Flatten every non-zero position. Returns the list of closing orders.
+    async def close_all_positions(
+        self,
+        *,
+        kind: str = "market",
+        cancel_working: bool = True,
+        con_ids: Optional[Iterable[int]] = None,
+        accounts: Optional[Iterable[str]] = None,
+    ) -> list[TrackedOrder]:
+        """Flatten non-zero positions. Returns the list of closing orders.
+
+        Without filters this closes **every** position on every account the
+        session sees, including ones this process never opened. Pass
+        ``con_ids`` (and/or ``accounts``) to restrict it to a strategy's own
+        contracts. Multi-leg positions are closed leg by leg; prefer the
+        strategy's combo close for spreads and use this as a backstop.
 
         Always pulls fresh positions from IB before acting — don't rely on
         ``positionEvent`` having reached us yet.
         """
         await self.refresh_positions()
+        wanted = set(con_ids) if con_ids is not None else None
+        allowed_accounts = set(accounts) if accounts is not None else None
         closed: list[TrackedOrder] = []
-        non_zero = [p for p in self._positions.values() if p.quantity != 0]
-        if not non_zero:
-            logger.info("close_all_positions: no non-zero positions found.")
+        targets = [
+            p
+            for p in self._positions.values()
+            if p.quantity != 0
+            and p.contract.get("conId")
+            and (wanted is None or p.contract.get("conId") in wanted)
+            and (allowed_accounts is None or p.account in allowed_accounts)
+        ]
+        if not targets:
+            logger.info("close_all_positions: no matching non-zero positions found.")
             return closed
-        for pos in non_zero:
-            con_id = pos.contract.get("conId")
-            if not con_id:
-                continue
-            tracked = await self.close_position(con_id, kind=kind, cancel_working=cancel_working)
+        for pos in targets:
+            tracked = await self.close_position(
+                pos.contract["conId"],
+                kind=kind,
+                cancel_working=cancel_working,
+                refresh=False,
+                account=pos.account,
+            )
             if tracked is not None:
                 closed.append(tracked)
         return closed
 
     async def cancel_all(self) -> list[str]:
-        """Cancel every non-terminal tracked order. Returns the cancelled uuids."""
+        """Cancel every non-terminal tracked order. Returns the cancelled uuids.
+
+        Cancels are sent concurrently; this does not wait for IB to confirm
+        them — use :meth:`wait_for` if you need that.
+        """
         self._require_started()
-        cancelled: list[str] = []
-        for t in list(self._tracked.values()):
-            if t.state in (OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED):
-                continue
-            await self.cancel(t.uuid)
-            cancelled.append(t.uuid)
-        return cancelled
+        targets = [t.uuid for t in self._tracked.values() if t.state not in _TERMINAL_STATES]
+        await asyncio.gather(*(self.cancel(uuid) for uuid in targets))
+        return targets
 
     async def cancel(self, uuid: str) -> None:
         """Request cancellation. Idempotent — already-terminal orders are a no-op."""
         self._require_started()
+        self._require_writable()
         tracked = self._tracked.get(uuid)
         if tracked is None:
             raise KeyError(f"Unknown order uuid: {uuid}")
-        if tracked.state in (OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED):
+        if tracked.state in _TERMINAL_STATES:
             logger.info(f"OrderManager: cancel ignored, {uuid} already {tracked.state.value}.")
             return
+        # No pacing slot: a cancel is the one message we never want delayed,
+        # and ib_async already throttles the socket.
         async with self._uuid_lock(uuid):
-            async with self._slot():
-                self._client.ib.cancelOrder(tracked.trade.order)
+            self._client.ib.cancelOrder(tracked.trade.order)
         logger.info(f"OrderManager: cancel requested for {uuid}.")
+
+    async def wait_for(self, predicate: Callable[[], bool], timeout: Optional[float] = None) -> bool:
+        """Wait until ``predicate()`` is true; return its final value.
+
+        Wakes on every order / fill / position event instead of polling, with
+        a 1-second safety recheck. ``timeout=None`` waits forever.
+
+        Example::
+
+            await om.wait_for(lambda: tracked.state == OrderState.FILLED, timeout=30)
+        """
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        while not predicate():
+            event = self._update
+            slice_ = _WAIT_RECHECK_SECS
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return predicate()
+                slice_ = min(slice_, remaining)
+            try:
+                await asyncio.wait_for(event.wait(), slice_)
+            except asyncio.TimeoutError:
+                pass
+        return True
+
+    def prune_terminal(self, max_age: float = 3600.0) -> int:
+        """Forget terminal orders last updated more than ``max_age`` seconds ago.
+
+        Long-running sessions can call this periodically to keep the tracked
+        map small. Returns the number of orders removed.
+        """
+        cutoff = time.time() - max_age
+        stale = [u for u, t in self._tracked.items() if t.state in _TERMINAL_STATES and t.last_update < cutoff]
+        for uuid in stale:
+            del self._tracked[uuid]
+            self._uuid_locks.pop(uuid, None)
+        return len(stale)
 
     # ------------------------------------------------------------------
     # Read-only views
@@ -543,11 +728,7 @@ class OrderManager:
 
     @property
     def open_orders(self) -> list[TrackedOrder]:
-        return [
-            t
-            for t in self._tracked.values()
-            if t.state not in (OrderState.FILLED, OrderState.CANCELLED, OrderState.REJECTED)
-        ]
+        return [t for t in self._tracked.values() if t.state not in _TERMINAL_STATES]
 
     @property
     def positions(self) -> list[PositionChanged]:
@@ -590,21 +771,9 @@ class OrderManager:
                 continue
             contract = self._position_contracts.get(conid)
             if contract is None:
-                # Build a skeleton from the serialised position dict so we can
-                # qualify it below. reqPositions returns contracts with empty
-                # exchange — reqTickers / placeOrder both reject those.
-                contract = Contract(
-                    conId=int(conid),
-                    symbol=pos.contract.get("symbol") or "",
-                    secType=pos.contract.get("secType") or "",
-                    exchange=pos.contract.get("exchange") or "",
-                    currency=pos.contract.get("currency") or "",
-                    lastTradeDateOrContractMonth=pos.contract.get("lastTradeDateOrContractMonth") or "",
-                    strike=pos.contract.get("strike") or 0.0,
-                    right=pos.contract.get("right") or "",
-                    multiplier=pos.contract.get("multiplier") or "",
-                    tradingClass=pos.contract.get("tradingClass") or "",
-                )
+                # reqPositions returns contracts with empty exchange — build a
+                # skeleton and qualify it below (reqTickers rejects those too).
+                contract = _contract_from_position(pos, int(conid))
             # Backfill the routing exchange via qualifyContractsAsync when it's
             # missing (positionEvent contracts often arrive without one).
             if not getattr(contract, "exchange", ""):
@@ -676,6 +845,7 @@ class OrderManager:
         return results
 
     def events(self) -> AsyncIterator[OrderEvent]:
+        """Async iterator over events. Each call is an independent subscriber."""
         return self._monitor.stream()
 
     def on_event(self, fn: Callable[[OrderEvent], None]) -> None:
@@ -692,6 +862,10 @@ class OrderManager:
         tracked = self._tracked.get(uuid)
         status = trade.orderStatus
         new_state = _IB_STATUS_TO_STATE.get(status.status, OrderState.SUBMITTED)
+        if tracked is not None and tracked.state == OrderState.REJECTED and new_state == OrderState.INACTIVE:
+            # Already rejected on the error channel; the trailing Inactive
+            # status must not reopen the order.
+            return
         event = StatusChanged(
             uuid=uuid,
             perm_id=int(trade.order.permId or 0),
@@ -712,11 +886,36 @@ class OrderManager:
         if new_state == OrderState.CANCELLED:
             self._dispatch(Cancelled(uuid=uuid, perm_id=event.perm_id))
         elif new_state == OrderState.INACTIVE:
-            # IB uses Inactive for rejected orders too; the actual reason rides
-            # the error channel.
+            # IB uses Inactive for rejected orders too (the reason rides the
+            # error channel), but also for orders it is merely holding, which
+            # can come back to life. Signal it, but keep the order INACTIVE —
+            # not terminal — so cancel() / cancel_all() can still reach it.
             self._dispatch(Rejected(uuid=uuid, perm_id=event.perm_id, reason=status.status))
-            if tracked is not None:
-                tracked.state = OrderState.REJECTED
+        if new_state in _TERMINAL_STATES:
+            self._uuid_locks.pop(uuid, None)
+        self._notify()
+
+    def _on_error(self, req_id: int, code: int, message: str, *_args: Any) -> None:
+        """Close out orders IB rejected outright (see ``_ORDER_REJECT_CODES``).
+
+        For order errors ``req_id`` is the IB orderId. Only orders that are
+        not working yet (pending submit) or parked as Inactive are affected:
+        a rejection of a *modification* leaves a live order live.
+        """
+        if code not in _ORDER_REJECT_CODES or req_id is None or req_id < 0:
+            return
+        tracked = next(
+            (t for t in self._tracked.values() if getattr(getattr(t.trade, "order", None), "orderId", None) == req_id),
+            None,
+        )
+        if tracked is None or tracked.state not in (OrderState.PENDING_SUBMIT, OrderState.INACTIVE):
+            return
+        tracked.state = OrderState.REJECTED
+        tracked.last_update = time.time()
+        self._dispatch(Rejected(uuid=tracked.uuid, perm_id=tracked.perm_id, reason=f"IB error {code}: {message}"))
+        self._uuid_locks.pop(tracked.uuid, None)
+        logger.warning(f"OrderManager: order {tracked.uuid} rejected by IB (error {code}).")
+        self._notify()
 
     def _on_exec_details(self, trade: Any, fill: Any) -> None:
         uuid = getattr(trade.order, "orderRef", None)
@@ -728,15 +927,21 @@ class OrderManager:
             # downstream consumers (TP/SL triggers, fill counters) don't double-count.
             logger.debug(f"OrderManager: duplicate exec {exec_id} for {uuid} ignored")
             return
-        self._seen_exec_ids.add(exec_id)
+        self._seen_exec_ids[exec_id] = None
+        if len(self._seen_exec_ids) > _MAX_SEEN_EXEC_IDS:
+            self._seen_exec_ids.popitem(last=False)
+        contract = getattr(fill, "contract", None)
         event = Filled(
             uuid=uuid,
             perm_id=int(trade.order.permId or 0),
             exec_id=exec_id,
             price=float(fill.execution.price),
             quantity=float(fill.execution.shares),
+            con_id=int(getattr(contract, "conId", 0) or 0),
+            sec_type=str(getattr(contract, "secType", "") or ""),
         )
         self._dispatch(event)
+        self._notify()
 
     def _on_position(self, position: Any) -> None:
         contract = serialise_contract(position.contract)
@@ -751,6 +956,7 @@ class OrderManager:
         if contract["conId"]:
             self._position_contracts[contract["conId"]] = position.contract
         self._dispatch(event)
+        self._notify()
 
     # ------------------------------------------------------------------
     # Internals
@@ -760,6 +966,11 @@ class OrderManager:
         """Enqueue for persistence + publish immediately to subscribers."""
         self._persist_queue.put_nowait(event)
         self._monitor.publish(event)
+
+    def _notify(self) -> None:
+        """Wake every wait_for() caller; they re-check their predicates."""
+        event, self._update = self._update, asyncio.Event()
+        event.set()
 
     async def _persist_worker(self) -> None:
         """Background task that drains the persist queue sequentially."""
@@ -772,12 +983,27 @@ class OrderManager:
             finally:
                 self._persist_queue.task_done()
 
+    async def _record_placement_failure(self, uuids: Sequence[str], exc: BaseException) -> None:
+        for uuid in uuids:
+            event = Rejected(uuid=uuid, perm_id=0, reason=f"placeOrder failed: {exc}")
+            try:
+                await self._store.append(event)
+            except Exception:  # noqa: BLE001
+                logger.exception(f"OrderManager: failed to persist placement failure for {uuid}")
+            self._monitor.publish(event)
+        logger.error(f"OrderManager: placeOrder failed for {list(uuids)}: {exc}")
+
     def _uuid_lock(self, uuid: str) -> asyncio.Lock:
         return self._uuid_locks[uuid]
 
     def _require_started(self) -> None:
         if not self._started:
             raise RuntimeError("OrderManager.start() must be called first.")
+
+    def _require_writable(self) -> None:
+        config = getattr(self._client, "config", None)
+        if config is not None and getattr(config, "readonly", False) is True:
+            raise RuntimeError("OrderManager: the session is configured readonly=True; orders are disabled.")
 
     def _check_account_safety(self, account: Optional[str]) -> None:
         """Police per-request account routing against the paper interlock.
@@ -818,6 +1044,42 @@ class OrderManager:
 # ---------------------------------------------------------------------------
 # Event builders (shared between place() and place_bracket())
 # ---------------------------------------------------------------------------
+
+
+def _order_con_ids(tracked: TrackedOrder) -> set[int]:
+    """Every conId an order trades: the contract itself plus any combo legs.
+
+    Prefers the live ``trade.contract`` (present for orders rehydrated after
+    a restart, whose ``request`` is ``None``) and falls back to the request.
+    """
+    ids: set[int] = set()
+    for contract in (getattr(tracked.trade, "contract", None), getattr(tracked.request, "contract", None)):
+        if contract is None:
+            continue
+        conid = getattr(contract, "conId", 0)
+        if isinstance(conid, int) and conid:
+            ids.add(conid)
+        for leg in getattr(contract, "comboLegs", None) or []:
+            leg_id = getattr(leg, "conId", 0)
+            if isinstance(leg_id, int) and leg_id:
+                ids.add(leg_id)
+    return ids
+
+
+def _contract_from_position(pos: PositionChanged, con_id: int) -> Contract:
+    """Rebuild a Contract skeleton from a serialised position (exchange may be empty)."""
+    return Contract(
+        conId=con_id,
+        symbol=pos.contract.get("symbol") or "",
+        secType=pos.contract.get("secType") or "",
+        exchange=pos.contract.get("exchange") or "",
+        currency=pos.contract.get("currency") or "",
+        lastTradeDateOrContractMonth=pos.contract.get("lastTradeDateOrContractMonth") or "",
+        strike=pos.contract.get("strike") or 0.0,
+        right=pos.contract.get("right") or "",
+        multiplier=pos.contract.get("multiplier") or "",
+        tradingClass=pos.contract.get("tradingClass") or "",
+    )
 
 
 def _contract_multiplier(serialised: dict, contract: Any) -> float:
@@ -876,6 +1138,7 @@ def _build_submitted_event(
     request: OrderRequest | BracketRequest,
     *,
     bracket_group: Optional[str] = None,
+    leg: Optional[str] = None,
 ) -> RequestSubmitted:
     extra: dict[str, Any] = {}
     kind: str
@@ -895,6 +1158,8 @@ def _build_submitted_event(
     else:
         kind = "market"
     extra["outside_rth"] = bool(getattr(request, "outside_rth", False))
+    if leg is not None:
+        extra["leg"] = leg
     side: OrderSide = request.side
     return RequestSubmitted(
         uuid=uuid,

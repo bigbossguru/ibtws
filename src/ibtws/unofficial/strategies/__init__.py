@@ -4,6 +4,7 @@ from .credit_spread import CreditSpreadStrategy
 from .models import (
     CreditSpreadParams,
     CreditSpreadPlan,
+    ExitResult,
     SpreadLeg,
     SpreadType,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "CreditSpreadParams",
     "CreditSpreadPlan",
     "CreditSpreadStrategy",
+    "ExitResult",
     "SpreadLeg",
     "SpreadType",
     "select_expiry",

@@ -298,7 +298,12 @@ async def test_inactive_status_emits_rejected(manager, fake_client):
     await asyncio.sleep(0)
 
     assert any(isinstance(e, Rejected) for e in seen)
-    assert tracked.state == OrderState.REJECTED
+    # Inactive is not terminal: IB may revive the order, so it must stay
+    # cancellable and visible as open.
+    assert tracked.state == OrderState.INACTIVE
+    assert tracked in manager.open_orders
+    await manager.cancel(tracked.uuid)
+    assert fake_client.ib.cancelOrder.called
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +352,7 @@ async def test_open_orders_excludes_terminal(manager, fake_client):
 async def test_close_position_flattens_long(manager, fake_client):
     contract = make_contract(con_id=42)
     pos = make_position(account="DU123", contract=contract, quantity=3, avg_cost=100)
-    fake_client.ib.positionEvent.fire(pos)
-    await asyncio.sleep(0)
+    fake_client.ib.reqPositionsAsync.return_value = [pos]
 
     fake_client.ib.qualifyContractsAsync.return_value = [contract]
     fake_client.ib.placeOrder.return_value = make_trade("close", perm_id=99)
@@ -364,8 +368,7 @@ async def test_close_position_flattens_long(manager, fake_client):
 async def test_close_position_flattens_short(manager, fake_client):
     contract = make_contract(con_id=7)
     pos = make_position(contract=contract, quantity=-2, avg_cost=100)
-    fake_client.ib.positionEvent.fire(pos)
-    await asyncio.sleep(0)
+    fake_client.ib.reqPositionsAsync.return_value = [pos]
 
     fake_client.ib.qualifyContractsAsync.return_value = [contract]
     fake_client.ib.placeOrder.return_value = make_trade("close", perm_id=1)
@@ -382,8 +385,7 @@ async def test_close_position_unknown_conid_returns_none(manager):
 
 async def test_close_position_zero_quantity_returns_none(manager, fake_client):
     pos = make_position(contract=make_contract(con_id=5), quantity=0, avg_cost=0)
-    fake_client.ib.positionEvent.fire(pos)
-    await asyncio.sleep(0)
+    fake_client.ib.reqPositionsAsync.return_value = [pos]
     assert await manager.close_position(5) is None
 
 
@@ -394,23 +396,72 @@ async def test_close_position_cancels_working_orders_first(manager, fake_client)
     working = await manager.limit(contract, OrderSide.BUY, 1, 100.0)
 
     pos = make_position(contract=contract, quantity=1, avg_cost=100)
-    fake_client.ib.positionEvent.fire(pos)
-    await asyncio.sleep(0)
+    fake_client.ib.reqPositionsAsync.return_value = [pos]
 
+    # IB confirms the cancel asynchronously via orderStatus.
+    def confirm_cancel(order):
+        trade = make_trade(working.uuid, perm_id=1, status="Cancelled", remaining=1)
+        asyncio.get_running_loop().call_soon(fake_client.ib.orderStatusEvent.fire, trade)
+
+    fake_client.ib.cancelOrder.side_effect = confirm_cancel
     fake_client.ib.qualifyContractsAsync.return_value = [contract]
     fake_client.ib.placeOrder.return_value = make_trade("close", perm_id=2)
 
-    await manager.close_position(11)
+    closed = await manager.close_position(11)
 
     assert fake_client.ib.cancelOrder.called
     cancelled_order = fake_client.ib.cancelOrder.call_args.args[0]
     assert cancelled_order is working.trade.order
+    assert closed is not None
+    assert working.state == OrderState.CANCELLED
+
+
+async def test_close_position_refuses_when_cancel_not_confirmed(manager, fake_client):
+    contract = make_contract(con_id=12)
+    fake_client.ib.placeOrder.return_value = make_trade("working", perm_id=1)
+    await manager.limit(contract, OrderSide.SELL, 1, 105.0)
+    fake_client.ib.reqPositionsAsync.return_value = [make_position(contract=contract, quantity=1)]
+    fake_client.ib.placeOrder.reset_mock()
+
+    with pytest.raises(RuntimeError, match="not confirmed"):
+        await manager.close_position(12, cancel_timeout=0.05)
+
+    fake_client.ib.placeOrder.assert_not_called()
+
+
+async def test_close_position_cancels_rehydrated_and_combo_orders(manager, fake_client):
+    from types import SimpleNamespace
+
+    from ibtws.unofficial.order.models import TrackedOrder
+
+    # An order rehydrated after restart has request=None; a combo order
+    # carries the leg only inside comboLegs. Both must be cancelled.
+    rehydrated_trade = make_trade("rehydrated", perm_id=5)
+    rehydrated_trade.contract = make_contract(con_id=33)
+    combo_trade = make_trade("combo", perm_id=6)
+    combo_trade.contract = SimpleNamespace(conId=0, secType="BAG", comboLegs=[SimpleNamespace(conId=33)])
+    unrelated_trade = make_trade("other", perm_id=7)
+    unrelated_trade.contract = make_contract(con_id=99)
+    for uuid, trade in (("rehydrated", rehydrated_trade), ("combo", combo_trade), ("other", unrelated_trade)):
+        manager._tracked[uuid] = TrackedOrder(uuid=uuid, request=None, trade=trade, state=OrderState.SUBMITTED)
+
+    def confirm_cancel(order):
+        trade = make_trade(order.orderRef, perm_id=order.permId, status="Cancelled")
+        asyncio.get_running_loop().call_soon(fake_client.ib.orderStatusEvent.fire, trade)
+
+    fake_client.ib.cancelOrder.side_effect = confirm_cancel
+    fake_client.ib.reqPositionsAsync.return_value = [make_position(contract=make_contract(con_id=33), quantity=2)]
+    fake_client.ib.placeOrder.return_value = make_trade("close", perm_id=8)
+
+    await manager.close_position(33)
+
+    cancelled_refs = {c.args[0].orderRef for c in fake_client.ib.cancelOrder.call_args_list}
+    assert cancelled_refs == {"rehydrated", "combo"}
 
 
 async def test_close_position_limit_requires_price(manager, fake_client):
     contract = make_contract(con_id=22)
-    fake_client.ib.positionEvent.fire(make_position(contract=contract, quantity=1, avg_cost=100))
-    await asyncio.sleep(0)
+    fake_client.ib.reqPositionsAsync.return_value = [make_position(contract=contract, quantity=1, avg_cost=100)]
     fake_client.ib.qualifyContractsAsync.return_value = [contract]
 
     with pytest.raises(ValueError, match="limit_price"):
@@ -420,10 +471,11 @@ async def test_close_position_limit_requires_price(manager, fake_client):
 async def test_close_all_positions(manager, fake_client):
     c1 = make_contract(con_id=1)
     c2 = make_contract(con_id=2)
-    fake_client.ib.positionEvent.fire(make_position(contract=c1, quantity=1))
-    fake_client.ib.positionEvent.fire(make_position(contract=c2, quantity=-1))
-    fake_client.ib.positionEvent.fire(make_position(contract=make_contract(con_id=3), quantity=0))
-    await asyncio.sleep(0)
+    fake_client.ib.reqPositionsAsync.return_value = [
+        make_position(contract=c1, quantity=1),
+        make_position(contract=c2, quantity=-1),
+        make_position(contract=make_contract(con_id=3), quantity=0),
+    ]
 
     fake_client.ib.qualifyContractsAsync.side_effect = lambda c: [c]
     fake_client.ib.placeOrder.side_effect = [
@@ -433,6 +485,32 @@ async def test_close_all_positions(manager, fake_client):
 
     closed = await manager.close_all_positions()
     assert len(closed) == 2  # zero-quantity skipped
+
+
+async def test_close_all_positions_respects_conid_filter(manager, fake_client):
+    fake_client.ib.reqPositionsAsync.return_value = [
+        make_position(contract=make_contract(con_id=1), quantity=1),
+        make_position(contract=make_contract(con_id=2), quantity=-1),
+    ]
+    fake_client.ib.placeOrder.return_value = make_trade("c2", perm_id=22)
+
+    closed = await manager.close_all_positions(con_ids=[2])
+
+    assert len(closed) == 1
+    assert fake_client.ib.placeOrder.call_args.args[0].conId == 2
+
+
+async def test_close_position_uses_fresh_quantity(manager, fake_client):
+    contract = make_contract(con_id=44)
+    # Cached event says 5, IB now reports 2 (a partial exit already filled).
+    fake_client.ib.positionEvent.fire(make_position(contract=contract, quantity=5))
+    await asyncio.sleep(0)
+    fake_client.ib.reqPositionsAsync.return_value = [make_position(contract=contract, quantity=2)]
+    fake_client.ib.placeOrder.return_value = make_trade("close", perm_id=1)
+
+    await manager.close_position(44)
+
+    assert fake_client.ib.placeOrder.call_args.args[1].totalQuantity == 2
 
 
 # ---------------------------------------------------------------------------
@@ -582,3 +660,219 @@ async def test_current_pnl_filters_by_conid(manager, fake_client):
     pnls = await manager.current_pnl(con_ids=[2])
     assert len(pnls) == 1
     assert pnls[0].contract["conId"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Reliability: failures, readonly, wait_for, resync, start rollback
+# ---------------------------------------------------------------------------
+
+
+async def test_place_failure_records_rejection(manager, fake_client, tmp_store):
+    fake_client.ib.placeOrder.side_effect = ConnectionError("socket closed")
+    seen: list = []
+    manager.on_event(lambda e: seen.append(e))
+
+    with pytest.raises(ConnectionError):
+        await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+
+    events = list(tmp_store.replay())
+    assert [type(e) for e in events] == [RequestSubmitted, Rejected]
+    assert events[1].uuid == events[0].uuid
+    assert "socket closed" in events[1].reason
+    assert any(isinstance(e, Rejected) for e in seen)
+
+
+async def test_place_failure_is_not_reported_local_only_on_restart(fake_client, tmp_store):
+    mgr = OrderManager(fake_client, tmp_store)
+    await mgr.start()
+    fake_client.ib.placeOrder.side_effect = ConnectionError("socket closed")
+    with pytest.raises(ConnectionError):
+        await mgr.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+    await mgr.stop()
+
+    report = await OrderManager(fake_client, tmp_store).start()
+    assert report.local_only == []
+
+
+async def test_place_bracket_persists_every_member(manager, fake_client, tmp_store):
+    fake_client.ib.placeOrder.side_effect = [make_trade("p"), make_trade("tp"), make_trade("sl")]
+    req = build_bracket(make_contract(), OrderSide.BUY, 1, take_profit_price=110, stop_loss_price=90)
+
+    tracked = await manager.place_bracket(req)
+
+    submitted = [e for e in tmp_store.replay() if isinstance(e, RequestSubmitted)]
+    assert [e.uuid for e in submitted] == [t.uuid for t in tracked]
+    assert [e.extra["leg"] for e in submitted] == ["parent", "tp", "sl"]
+
+
+async def test_place_bracket_failure_cancels_placed_members(manager, fake_client, tmp_store):
+    fake_client.ib.placeOrder.side_effect = [make_trade("p"), ConnectionError("socket closed")]
+    req = build_bracket(make_contract(), OrderSide.BUY, 1, take_profit_price=110, stop_loss_price=90)
+
+    with pytest.raises(ConnectionError):
+        await manager.place_bracket(req)
+
+    assert fake_client.ib.cancelOrder.call_count == 1
+    rejected = [e for e in tmp_store.replay() if isinstance(e, Rejected)]
+    assert len(rejected) == 3
+
+
+async def test_readonly_config_blocks_orders(fake_client, tmp_store):
+    from types import SimpleNamespace
+
+    fake_client.config = SimpleNamespace(readonly=True)
+    mgr = OrderManager(fake_client, tmp_store)
+    await mgr.start()
+    try:
+        with pytest.raises(RuntimeError, match="readonly"):
+            await mgr.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+        fake_client.ib.placeOrder.assert_not_called()
+    finally:
+        await mgr.stop()
+
+
+async def test_wait_for_wakes_on_status_event(manager, fake_client):
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=3)
+    tracked = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+
+    filled = make_trade(tracked.uuid, perm_id=3, status="Filled", filled=1, remaining=0)
+    asyncio.get_running_loop().call_later(0.01, fake_client.ib.orderStatusEvent.fire, filled)
+
+    assert await manager.wait_for(lambda: tracked.state == OrderState.FILLED, timeout=2.0)
+
+
+async def test_wait_for_times_out(manager):
+    assert await manager.wait_for(lambda: False, timeout=0.02) is False
+
+
+async def test_start_failure_unbinds_events(fake_client, tmp_path):
+    from ibtws.unofficial.order import JsonStore
+
+    path = tmp_path / "corrupt.jsonl"
+    path.write_text("not json\n{}\n")
+    mgr = OrderManager(fake_client, JsonStore(path, fsync=False))
+
+    with pytest.raises(ValueError):
+        await mgr.start()
+
+    assert fake_client.ib.orderStatusEvent.handlers == []
+    assert fake_client.ib.execDetailsEvent.handlers == []
+    assert fake_client.ib.positionEvent.handlers == []
+
+
+async def test_start_survives_torn_last_line(fake_client, tmp_store):
+    await tmp_store.append(Cancelled(uuid="u-old", perm_id=1))
+    tmp_store.close()
+    with tmp_store.path.open("a", encoding="utf-8") as f:
+        f.write('{"kind":"status_changed","uuid":"u-tor')
+
+    mgr = OrderManager(fake_client, tmp_store)
+    await mgr.start()
+    await mgr.stop()
+
+
+async def test_resync_applies_status_missed_while_disconnected(manager, fake_client):
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=9)
+    tracked = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+    seen: list = []
+    manager.on_event(lambda e: seen.append(e))
+
+    fake_client.ib.trades.return_value = [make_trade(tracked.uuid, perm_id=9, status="Filled", filled=1)]
+    await manager.resync()
+
+    assert tracked.state == OrderState.FILLED
+    assert any(isinstance(e, StatusChanged) and e.state == OrderState.FILLED.value for e in seen)
+
+
+async def test_start_registers_reconnect_listener(fake_client, tmp_store):
+    from unittest.mock import MagicMock
+
+    fake_client.add_reconnect_listener = MagicMock()
+    fake_client.remove_reconnect_listener = MagicMock()
+    mgr = OrderManager(fake_client, tmp_store)
+    await mgr.start()
+    fake_client.add_reconnect_listener.assert_called_once_with(mgr.resync)
+    await mgr.stop()
+    fake_client.remove_reconnect_listener.assert_called_once_with(mgr.resync)
+
+
+async def test_fill_event_carries_contract(manager, fake_client):
+    from types import SimpleNamespace
+
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=7)
+    tracked = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+    seen: list = []
+    manager.on_event(lambda e: seen.append(e))
+
+    fill = make_fill("E9", price=1.0, shares=1)
+    fill.contract = SimpleNamespace(conId=555, secType="OPT")
+    fake_client.ib.execDetailsEvent.fire(make_trade(tracked.uuid, perm_id=7), fill)
+
+    [ev] = [e for e in seen if isinstance(e, Filled)]
+    assert (ev.con_id, ev.sec_type) == (555, "OPT")
+
+
+async def test_events_stream_fans_out_to_every_subscriber(manager, fake_client):
+    a = manager.events()
+    b = manager.events()
+    first_a = asyncio.ensure_future(a.__anext__())
+    first_b = asyncio.ensure_future(b.__anext__())
+    await asyncio.sleep(0)
+
+    fake_client.ib.positionEvent.fire(make_position(contract=make_contract(con_id=1), quantity=1))
+
+    ev_a, ev_b = await asyncio.wait_for(asyncio.gather(first_a, first_b), timeout=1.0)
+    assert isinstance(ev_a, PositionChanged) and isinstance(ev_b, PositionChanged)
+
+
+async def test_ib_rejection_error_makes_inactive_order_terminal(manager, fake_client, tmp_store):
+    # Live TWS sequence for e.g. a MiFID/KID rejection: status Inactive, then error 201.
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=1, order_id=41)
+    tracked = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+
+    fake_client.ib.orderStatusEvent.fire(make_trade(tracked.uuid, perm_id=1, status="Inactive", order_id=41))
+    assert tracked.state == OrderState.INACTIVE
+    fake_client.ib.errorEvent.fire(41, 201, "Order rejected - reason:No Trading Permission", None)
+
+    assert tracked.state == OrderState.REJECTED
+    assert tracked not in manager.open_orders
+    # A late Inactive status must not reopen it, and cancel_all leaves it alone.
+    fake_client.ib.orderStatusEvent.fire(make_trade(tracked.uuid, perm_id=1, status="Inactive", order_id=41))
+    assert tracked.state == OrderState.REJECTED
+    assert await manager.cancel_all() == []
+
+    await manager.stop()
+    report = await OrderManager(fake_client, tmp_store).start()
+    assert tracked.uuid not in report.local_only
+
+
+async def test_rejection_error_before_status_wins(manager, fake_client):
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=1, order_id=42)
+    tracked = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+
+    fake_client.ib.errorEvent.fire(42, 201, "Order rejected", None)
+    fake_client.ib.orderStatusEvent.fire(make_trade(tracked.uuid, perm_id=1, status="Inactive", order_id=42))
+
+    assert tracked.state == OrderState.REJECTED
+
+
+async def test_reject_error_ignored_for_working_order(manager, fake_client):
+    # e.g. a rejected modification: the original order is still live.
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=1, order_id=43)
+    tracked = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+    fake_client.ib.orderStatusEvent.fire(make_trade(tracked.uuid, perm_id=1, status="Submitted", order_id=43))
+
+    fake_client.ib.errorEvent.fire(43, 201, "Order rejected", None)
+
+    assert tracked.state == OrderState.SUBMITTED
+
+
+async def test_cancel_of_unknown_inactive_order_closes_it(manager, fake_client):
+    fake_client.ib.placeOrder.return_value = make_trade("p", perm_id=1, order_id=44)
+    tracked = await manager.place(build_limit(make_contract(), OrderSide.BUY, 1, 100.0))
+    fake_client.ib.orderStatusEvent.fire(make_trade(tracked.uuid, perm_id=1, status="Inactive", order_id=44))
+
+    await manager.cancel(tracked.uuid)
+    fake_client.ib.errorEvent.fire(44, 10147, "OrderId 44 that needs to be cancelled is not found.", None)
+
+    assert await manager.wait_for(lambda: tracked.state in (OrderState.REJECTED,), timeout=0.1)

@@ -16,7 +16,7 @@ from typing import Optional, Sequence
 from ib_async import Bag, Contract
 
 from ibtws.unofficial.option import OptionQuote
-from ibtws.unofficial.order.models import OrderSide, TimeInForce
+from ibtws.unofficial.order.models import OrderSide, TimeInForce, TrackedOrder
 
 
 class SpreadType(str, Enum):
@@ -96,6 +96,11 @@ class CreditSpreadParams:
         Forward ``outsideRth=True`` to the underlying IB order so it can fill
         during pre- and post-market sessions. Has no effect on instruments
         that don't trade outside RTH (e.g. SPX/SPXW index options on CBOE).
+    require_live_quotes:
+        Refuse to build a plan from, or make exit decisions on, quotes that
+        are not live (IB market data type 1). Frozen and delayed data can be
+        minutes or hours old. Leave ``False`` for paper accounts without a
+        live market-data subscription.
 
     Universe knobs
     --------------
@@ -133,6 +138,7 @@ class CreditSpreadParams:
     tif: TimeInForce = TimeInForce.DAY
     account: Optional[str] = None
     outside_rth: bool = False  # set True to allow fills in pre-/post-market sessions
+    require_live_quotes: bool = False
 
     # Exit knobs
     take_profit_pct: Optional[float] = 0.5
@@ -222,3 +228,24 @@ class CreditSpreadPlan:
             f"width={self.width:g} credit={self.net_credit:.2f} "
             f"max_loss={self.max_loss:.2f} Δshort={self.short_delta:.3f}"
         )
+
+
+@dataclass(frozen=True)
+class ExitResult:
+    """Outcome of :meth:`CreditSpreadStrategy.close_and_confirm`.
+
+    ``closed_quantity`` counts spreads IB confirmed as bought back across all
+    attempts. ``order`` is the last closing order sent (``None`` if none was).
+    """
+
+    order: Optional[TrackedOrder]
+    requested_quantity: float
+    closed_quantity: float
+
+    @property
+    def remaining_quantity(self) -> float:
+        return max(self.requested_quantity - self.closed_quantity, 0.0)
+
+    @property
+    def complete(self) -> bool:
+        return self.remaining_quantity <= 1e-9

@@ -11,7 +11,7 @@ flowchart TB
     end
 
     subgraph Core["🔌 Core Foundation (unofficial/)"]
-        Client[IBKRClient<br/>connect/disconnect<br/>market + historical data]
+        Client[IBKRClient<br/>connect/disconnect<br/>auto-reconnect + listeners<br/>market + historical data]
         Pacing[_pacing<br/>ThrottledExecutor<br/>semaphore + token bucket]
         Helpers[helpers<br/>safe_pick_value<br/>calc_dte / chunked]
         IB[(ib_async.IB<br/>TWS/Gateway)]
@@ -25,7 +25,7 @@ flowchart TB
     end
 
     subgraph Orders["📝 order/"]
-        OrderMgr[OrderManager<br/>place/cancel/monitor<br/>reconcile on startup]
+        OrderMgr[OrderManager<br/>place/cancel/monitor<br/>reconcile on startup<br/>resync on reconnect]
         Factory[factory<br/>build_market/limit<br/>stop/bracket]
         Store[(JsonStore<br/>JSONL persistence)]
         Monitor[OrderMonitor<br/>event bus]
@@ -41,7 +41,7 @@ flowchart TB
     end
 
     subgraph Strategies["🎯 strategies/"]
-        CreditSpread[CreditSpreadStrategy<br/>build_plan / place<br/>monitor_and_exit]
+        CreditSpread[CreditSpreadStrategy<br/>build_plan / place<br/>monitor_and_exit<br/>confirmed exits]
         StratModels[CreditSpreadParams<br/>CreditSpreadPlan<br/>SpreadLeg / SpreadType]
     end
 
