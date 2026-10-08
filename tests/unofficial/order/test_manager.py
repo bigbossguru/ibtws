@@ -130,8 +130,9 @@ async def test_place_status_event_updates_tracked(manager, fake_client, tmp_stor
 
     status_trade = make_trade(tracked.uuid, perm_id=42, status="Submitted", filled=0, remaining=2)
     fake_client.ib.orderStatusEvent.fire(status_trade)
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    # The persist worker writes in a thread: wait for it to drain instead of
+    # assuming a couple of event-loop yields are enough (flaky on Linux CI).
+    await manager._persist_queue.join()
 
     assert tracked.state == OrderState.SUBMITTED
     # last event in store should be a StatusChanged
