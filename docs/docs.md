@@ -198,7 +198,7 @@ Throttled, fault-tolerant snapshot fetcher built on `IBKRClient`. Does NOT
 own the connection — the caller handles `connect()` / `disconnect()`.
 
 ```python
-OptionChainFetcher(client: IBKRClient, *, chain_cache_ttl=900.0, snapshot_timeout=30.0)
+OptionChainFetcher(client: IBKRClient, *, chain_cache_ttl=900.0, quote_timeout=8.0)
 ```
 
 Chain definitions are cached for `chain_cache_ttl` seconds (`0` disables the
@@ -209,17 +209,19 @@ plans on one underlying skip `reqSecDefOptParams` / `qualifyContracts`.
 | Method | Purpose |
 |---|---|
 | `async fetch_chain_definition(underlying, *, exchange="SMART", trading_class=None) -> ChainDefinition` | Returns the (expirations × strikes) universe for one underlying. Raises `ValueError` if the underlying is unqualified, `LookupError` if no option params match. Falling back to another exchange's chain (no `trading_class` given) logs a warning |
-| `async fetch_snapshot(underlying, *, exchange="SMART", currency="USD", trading_class=None, rights=("C","P"), expirations=None, expiry_from/to=None, strikes=None, strike_from/to=None, strike_window_pct=0.2, batch_size=100, as_dataframe=False) -> list[OptionQuote] \| DataFrame` | Resolve + quote a slice of the chain. **Fault-tolerant**: qualify or snapshot failures are logged at WARNING and excluded, so the caller always gets a partial answer. Auto-windows strikes around spot (`strike_window_pct`) when no explicit strikes are given |
+| `async fetch_snapshot(underlying, *, exchange="SMART", currency="USD", trading_class=None, rights=("C","P"), expirations=None, expiry_from/to=None, strikes=None, strike_from/to=None, strike_window_pct=0.2, batch_size=100, as_dataframe=False) -> list[OptionQuote] \| DataFrame` | Resolve + quote a slice of the chain. **Fault-tolerant**: qualify failures are logged at WARNING and excluded, contracts whose stream never fills are dropped, so the caller always gets a partial answer. Auto-windows strikes around spot (`strike_window_pct`) when no explicit strikes are given |
 
 Selection precedence for both expirations and strikes: an explicit whitelist
 (`expirations=` / `strikes=`) wins over an inclusive range (`*_from` / `*_to`).
 Quotes with no `bid`, `ask` and `iv` are dropped before returning.
 
-Market-data subscriptions are opened and cancelled inside each snapshot batch
-(subscribe → settle 0.2 s → one snapshot per contract via `snapshot_each`,
-bounded by `snapshot_timeout` → cancel in `finally`), so subscriptions are
-released even when a snapshot fails or times out, and one unsubscribed
-contract only drops its own quote. Spot for the strike window comes from a plain snapshot
+Quotes come from streaming market-data subscriptions opened and cancelled
+inside each batch (subscribe with generic ticks `100,101,104,106` → wait until
+every ticker has a quote, model greeks and open interest, or `quote_timeout`
+runs out → cancel in `finally`). There is no per-contract snapshot: it took
+~16 s per batch and cannot carry generic ticks, while the stream completes in
+~4 s (live SPXW paper check). Subscriptions are released even when waiting is
+interrupted, and an unsubscribed contract only drops its own quote. Spot for the strike window comes from a plain snapshot
 (`Ticker.marketPrice()`, then last / close / mid).
 
 ### `option.iv_rank.IVRankCalculator`
@@ -693,8 +695,9 @@ was never sent and can decide whether to re-submit or drop it.
   the strategy's quote streams are restored through reconnect listeners.
 - Exits are confirmed, not fire-and-forget: `close_and_confirm` re-prices
   unfilled closes and escalates stop-loss exits to a marketable price.
-- `fetch_snapshot` — failed qualify or snapshot batches are logged at
-  WARNING and excluded; the caller always gets a partial answer.
+- `fetch_snapshot` — failed qualifies are logged at WARNING and excluded,
+  contracts whose stream never fills are dropped; the caller always gets a
+  partial answer.
 - The persist worker logs store failures instead of raising, so the event
   bus still publishes.
 - `current_pnl` — a missing quote yields `None` fields, never a fabricated 0.

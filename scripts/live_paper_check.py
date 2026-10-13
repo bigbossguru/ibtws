@@ -112,7 +112,7 @@ async def s_read_only(ctx):
         ctx.spx, trading_class="SPXW", expirations=[ctx.today], strike_window_pct=0.01
     )
     check(
-        "per-contract snapshot of the 0DTE window",
+        "streamed quotes of the 0DTE window",
         len(quotes) > 20,
         f"{len(quotes)} quotes in {time.perf_counter() - t:.1f}s",
     )

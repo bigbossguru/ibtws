@@ -95,17 +95,55 @@ def fake_client():
     )
 
 
+_STREAM_FIELDS = ("bid", "ask", "last", "volume", "callOpenInterest", "putOpenInterest", "modelGreeks")
+
+
+class FakeStream:
+    """``reqMktData`` double whose values arrive on the next poll, like a real stream.
+
+    The fetcher clears the fields it waits for right after subscribing (ib_async
+    reuses tickers), so a ticker handed back already filled would never count
+    as fresh. ``stream(factory)`` returns the ``side_effect``: the factory's
+    values are captured and delivered by the next ``asyncio.sleep`` poll.
+    """
+
+    def __init__(self) -> None:
+        self._pending: list[tuple[object, dict]] = []
+
+    def __call__(self, factory):
+        def subscribe(contract, **_kw):
+            ticker = factory(contract)
+            values = {f: getattr(ticker, f) for f in _STREAM_FIELDS if hasattr(ticker, f)}
+            self._pending.append((ticker, values))
+            return ticker
+
+        return subscribe
+
+    def deliver(self) -> None:
+        for ticker, values in self._pending:
+            for field, value in values.items():
+                setattr(ticker, field, value)
+        self._pending.clear()
+
+
+@pytest.fixture
+def stream() -> FakeStream:
+    return FakeStream()
+
+
 @pytest.fixture(autouse=True)
-def _no_sleep(monkeypatch):
-    """Replace the per-batch ``asyncio.sleep`` pauses in chains.py with no-ops."""
+def _no_sleep(monkeypatch, stream):
+    """Replace the ``asyncio.sleep`` polls in chains.py: no wait, deliver pending ticks."""
     import ibtws.unofficial.option.chains as chains_module
 
     async def _instant(_seconds):
-        return None
+        stream.deliver()
 
     monkeypatch.setattr(chains_module.asyncio, "sleep", _instant)
 
 
 @pytest.fixture
 def fetcher(fake_client) -> OptionChainFetcher:
-    return OptionChainFetcher(fake_client)
+    # Short quote_timeout: tests whose tickers never complete must not spin for
+    # the production default.
+    return OptionChainFetcher(fake_client, quote_timeout=0.2)

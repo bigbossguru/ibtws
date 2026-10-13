@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Iterable, Sequence
 
@@ -9,7 +10,7 @@ import pandas as pd
 from ib_async import Contract, Option, Ticker
 
 from ibtws.unofficial.client import IBKRClient
-from ibtws.unofficial.helpers import chunked, safe_pick_value, snapshot_each
+from ibtws.unofficial.helpers import chunked, safe_pick_value
 
 from .models import ChainDefinition, OptionQuote
 from .utils import (
@@ -21,14 +22,19 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-# Snapshots in a batch run concurrently and each batch takes roughly the same
-# few seconds regardless of size, so fewer, larger batches are faster. 100
-# stays well inside what a default TWS session accepts (verified live with
-# 150 contracts per batch without error 101).
+# A batch is one set of concurrent streaming subscriptions; batches run one
+# after another so the open market-data lines stay within what a default TWS
+# session accepts (100 lines; verified live with 150 per batch without error
+# 101). Each batch waits about the same few seconds regardless of size, so
+# fewer, larger batches are faster.
 _SNAPSHOT_BATCH = 100
 _QUALIFY_BATCH = 100
-_SETTLE_SECS = 0.2
-_DEFAULT_SNAPSHOT_TIMEOUT = 30.0
+# 100 option volume, 101 open interest, 104 historical vol, 106 implied vol.
+_GENERIC_TICKS = "100,101,104,106"
+_POLL_SECS = 0.05
+# Live SPXW paper check (2026-10-13): quotes, OI and greeks complete for 83/83
+# contracts in 3.6-3.8 s. The timeout only bounds contracts that never complete.
+_DEFAULT_QUOTE_TIMEOUT = 8.0
 _DEFAULT_CHAIN_TTL = 900.0
 
 _QualifyKey = tuple[str, str, float, str, str, str, str, str]
@@ -62,11 +68,11 @@ class OptionChainFetcher:
         client: IBKRClient,
         *,
         chain_cache_ttl: float = _DEFAULT_CHAIN_TTL,
-        snapshot_timeout: float = _DEFAULT_SNAPSHOT_TIMEOUT,
+        quote_timeout: float = _DEFAULT_QUOTE_TIMEOUT,
     ) -> None:
         self._client = client
         self._chain_ttl = chain_cache_ttl
-        self._snapshot_timeout = snapshot_timeout
+        self._quote_timeout = quote_timeout
         self._chain_cache: dict[tuple, tuple[float, ChainDefinition]] = {}
         self._qualified: dict[_QualifyKey, Option] = {}
 
@@ -270,29 +276,50 @@ class OptionChainFetcher:
         return resolved
 
     async def _request_tickers(self, contracts: list[Option]) -> list[Ticker]:
-        """Subscribe, wait, snapshot, cancel.
+        """Subscribe, wait until every ticker is complete (or ``quote_timeout``), cancel.
 
-        The streaming subscriptions are always cancelled, even when the
-        snapshot fails or times out, so market-data lines never leak.
+        The data comes from the streaming subscription alone. A per-contract
+        snapshot on top of it took ~16 s per batch (IB answers a snapshot only
+        once all its ticks are in) and could not carry the generic ticks (OI)
+        anyway; the stream had quotes, OI and greeks within ~4 s. A contract
+        that never completes (no greeks, unsubscribed) is returned with what
+        it has once ``quote_timeout`` runs out — empty ones are filtered by
+        the caller.
+
+        The subscriptions are always cancelled, even when waiting is
+        interrupted, so market-data lines never leak.
         """
         ib = self._client.ib
         subscribed: list[Option] = []
+        tickers: list[Ticker] = []
         try:
             for c in contracts:
-                ib.reqMktData(c, genericTickList="100,101,104,106")
+                ticker = ib.reqMktData(c, genericTickList=_GENERIC_TICKS)
                 subscribed.append(c)
-            await asyncio.sleep(_SETTLE_SECS)
-            # Per-contract snapshots: one unsubscribed or erroring contract
-            # no longer drops the whole batch.
-            snapshots = await snapshot_each(ib, contracts, timeout=self._snapshot_timeout)
-            tickers = [t for t in snapshots if t is not None]
+                # ib_async reuses one Ticker per contract and keeps the last
+                # subscription's values: without this the wait below would pass
+                # at once on quotes from the previous fetch. No tick of the new
+                # subscription can land before the first await, so everything
+                # seen after the reset is fresh.
+                _reset_awaited_fields(ticker)
+                tickers.append(ticker)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self._quote_timeout
+            while not all(_ticker_complete(t) for t in tickers) and loop.time() < deadline:
+                await asyncio.sleep(_POLL_SECS)
+            incomplete = sum(not _ticker_complete(t) for t in tickers)
+            if incomplete:
+                logger.info(
+                    f"OptionChainFetcher: {incomplete} of {len(tickers)} tickers still without "
+                    f"quote/greeks/OI after {self._quote_timeout:.1f}s"
+                )
         finally:
             for c in subscribed:
                 try:
                     ib.cancelMktData(c)
                 except Exception:  # noqa: BLE001
                     logger.exception(f"OptionChainFetcher: cancelMktData failed for conId={getattr(c, 'conId', 0)}")
-        return list(tickers)
+        return tickers
 
     async def _fetch_spot(self, underlying: Contract) -> float | None:
         """Best-effort spot price from a plain snapshot (no generic ticks, no settle wait)."""
@@ -310,3 +337,22 @@ class OptionChainFetcher:
         if bid is not None and ask is not None:
             return (bid + ask) / 2.0
         return None
+
+
+def _received(value: object) -> bool:
+    """True once IB has sent a value for the field (``Ticker`` starts every field at NaN)."""
+    return isinstance(value, (int, float)) and not math.isnan(value)
+
+
+def _ticker_complete(ticker: Ticker) -> bool:
+    """Quote, model greeks and open interest for the contract's right have all arrived."""
+    has_quote = _received(getattr(ticker, "bid", None)) or _received(getattr(ticker, "ask", None))
+    oi_field = "callOpenInterest" if ticker.contract.right == "C" else "putOpenInterest"
+    return has_quote and getattr(ticker, "modelGreeks", None) is not None and _received(getattr(ticker, oi_field, None))
+
+
+def _reset_awaited_fields(ticker: Ticker) -> None:
+    """Clear the fields ``_ticker_complete`` waits for, so only fresh ticks can fill them."""
+    for field in ("bid", "ask", "callOpenInterest", "putOpenInterest"):
+        setattr(ticker, field, math.nan)
+    ticker.modelGreeks = None
